@@ -357,7 +357,7 @@ class SpaceRDI:
             an error will be raised.
         """
         if self.concat is None:
-            raise AttributeError("""Prior to executing "run_rdi", you must load a
+            raise ValueError("""Prior to executing "run_rdi", you must load a
             concatenation using the load_concat method.""")
         
         output_ext = copy(self.output_ext)
@@ -586,14 +586,15 @@ class SpaceRDI:
                             recalc_psf_grid=False, psf_grid_kwargs={}, psfgrids_output_dir='psfgrids',
                             fetch_opd_by_date=True):
 
-        if self.convolver is None:
+        convolver_args = dict(reference_index=reference_index, coron_offsets=coron_offsets, fov_pixels=fov_pixels, osamp=osamp, output_ext=output_ext,
+                                            prefetch_psf_grid=prefetch_psf_grid, recalc_psf_grid=recalc_psf_grid, psf_grid_kwargs=psf_grid_kwargs)
+        
+        if self.convolver is None or convolver_args != self.convolver_args: # If the convolver is not already set up or the args have changed
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               psfgrids_output_dir=psfgrids_output_dir, fetch_opd_by_date=fetch_opd_by_date, pad_data=self.pad_data)
+            self.convolver_args = convolver_args
 
-            self.convolver_args = dict(reference_index=reference_index, coron_offsets=coron_offsets, fov_pixels=fov_pixels, osamp=osamp, output_ext=output_ext,
-                                            prefetch_psf_grid=prefetch_psf_grid, recalc_psf_grid=recalc_psf_grid, psf_grid_kwargs=psf_grid_kwargs)
-                                            
         if self.concat != self.convolver.concat:
             self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, **self.convolver_args)
         pass 

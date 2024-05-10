@@ -94,7 +94,7 @@ def psf_convolve_cpu(im, psf_im):
     return imcon
 
 
-def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, shift=None, osamp=2, fov_pixels=201, show_progress=True):
+def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, normalize='exit_pupil', shift=None, osamp=2, fov_pixels=201, show_progress=True):
     
     """
     Creates a grid of synthetic PSFs using a WebbPSF NIRCam or MIRI WebbPSF object. The spatial sampling used here is not appropriate for MIRI FQPM data. 
@@ -125,6 +125,10 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
 
         rmax: float
             The maximum radial separation in arcseconds from the coronagraph center to use for the PSF grid.
+
+        normalize: str
+            The normalization to use for the PSFs. Options are 'exit_pupil' (default), 'first', and 'last' 
+            (see WebbPSF documentation for more info).
 
         shift: ndarray
             The detector sampled shift (in pixels) needed to place the PSF as the geometric center of the array.
@@ -190,7 +194,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     for psf_offset in iterator:
         inst_grid.options['coron_shift_x'] = -psf_offset[0]
         inst_grid.options['coron_shift_y'] = -psf_offset[1]
-        psf = inst_grid.calc_psf(source=source_spectrum, fov_pixels=fov_pixels, oversample=osamp, normalize='exit_pupil')[2].data
+        psf = inst_grid.calc_psf(source=source_spectrum, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize)[2].data
         psfs.append(psf)
     psfs = np.array(psfs)
     
@@ -201,7 +205,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     field_rot = 0 if inst._rotation is None else inst._rotation
     
     psf_offsets_polar = np.array([rvals_all, thvals_all-field_rot])
-    psf_offsets = webbpsf_ext.coords.rtheta_to_xy(*psf_offsets_polar)
+    psf_offsets = np.array(webbpsf_ext.coords.rtheta_to_xy(*psf_offsets_polar))
     
     return psfs, psf_offsets_polar, psf_offsets
 
