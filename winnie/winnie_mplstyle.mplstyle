@@ -1,0 +1,34 @@
+axes.formatter.min_exponent: 4
+
+axes.linewidth: 1.5
+ytick.major.width:   1.5
+ytick.minor.width:   1.5
+xtick.major.width:   1.5
+xtick.minor.width:   1.5
+
+errorbar.capsize: 3.0
+lines.markeredgewidth: 1.5
+
+xtick.major.size:    8.0
+ytick.major.size:    8.0 
+   
+xtick.minor.size:    4.5 
+ytick.minor.size:    4.5  
+
+xtick.direction:     in
+ytick.direction:     in
+
+xtick.minor.visible: True
+ytick.minor.visible: True
+
+xtick.top:          True 
+ytick.right:        True
+
+font.family:	serif
+font.size: 16
+
+mathtext.fontset: dejavuserif
+mathtext.it: serif:italic
+mathtext.rm: serif
+mathtext.bf: serif:bold
+mathtext.default: rm
