@@ -315,8 +315,8 @@ def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp
 
 
 try:
-    import cupy as cp
-    from cupyx.scipy import signal as cp_signal
+    import cupy as cp # type: ignore
+    from cupyx.scipy import signal as cp_signal # type: ignore
     gpu = cp.cuda.Device(0)
 except ModuleNotFoundError:
-    ""
+    pass

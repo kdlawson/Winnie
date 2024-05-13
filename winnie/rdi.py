@@ -443,7 +443,7 @@ def build_annular_rdi_zones(nx, ny, cent, r_opt=None, r_sub=None, pxscale=None, 
     return (optzones, subzones)
 
 try:
-    import cupy as cp
+    import cupy as cp # type: ignore
     gpu = cp.cuda.Device(0)
 except ModuleNotFoundError:
-    ""
+    pass

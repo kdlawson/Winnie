@@ -448,6 +448,8 @@ class SpaceRDI:
 
     
     def set_zones(self, optzones, subzones, exclude_opt_nans=True):
+        if np.any(subzones.sum(axis=0) > 1):
+            raise ValueError("Subtraction zones are invalid; some pixels are included in multiple subtraction zones.")
         # If spatial dims of zones match those of the uncropped data:
         if np.all(np.asarray(optzones.shape[-2:]) == np.asarray(self._imcube_sci.shape[-2:])):
             self._optzones = np.asarray(optzones)

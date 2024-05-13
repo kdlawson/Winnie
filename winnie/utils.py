@@ -491,8 +491,8 @@ def free_gpu(*args):
 
 
 try:
-    import cupy as cp
-    from cupyx.scipy import ndimage as cp_ndimage
+    import cupy as cp # type: ignore
+    from cupyx.scipy import ndimage as cp_ndimage # type: ignore
     gpu = cp.cuda.Device(0)
 except ModuleNotFoundError:
-    ""
+    pass
