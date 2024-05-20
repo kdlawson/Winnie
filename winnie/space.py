@@ -263,9 +263,9 @@ class SpaceRDI:
         cent_adj = np.array([dxmin_pad, dymin_pad])
         
         self._imcube_sci = np.pad(self._imcube_sci, imc_padding, constant_values=np.nan)
-        self._errcube_sci = np.pad(self._errcube_sci, imc_padding, constant_values=np.nan)
+        self._errcube_sci = np.pad(self._errcube_sci, imc_padding, constant_values=np.nan) if self.prop_err else None
         self._imcube_ref = np.pad(self._imcube_ref, imc_padding, constant_values=np.nan)
-        self._errcube_ref = np.pad(self._errcube_ref, imc_padding, constant_values=np.nan)
+        self._errcube_ref = np.pad(self._errcube_ref, imc_padding, constant_values=np.nan) if self.prop_err else None
 
         self._c_star += cent_adj
         self._c_coron_sci += cent_adj
@@ -792,14 +792,21 @@ class SpaceConvolution:
         
         reference_file = files[reference_index]
 
-        self.image_mask = header0['CORONMSK'].replace('MASKA', 'MASK')
+        self.image_mask = header0['CORONMSK'].replace('MASKA', 'MASK').replace('4QPM_', 'FQPM')
         self.aperturename = header0['APERNAME']
         self.filt = header0['FILTER']
-        self.channel = header0['CHANNEL']
+        self.channel = header0.get('CHANNEL', None)
         self.instrument = header0['INSTRUME']
         self.date = header0['DATE-BEG']
         if 'PUPIL' in header0:
             self.pupil_mask = header0['PUPIL']
+        else:
+            if self.filt == 'F2300C':
+                self.pupil_mask = 'MASKLYOT'
+            elif self.filt.endswith('C'):
+                self.pupil_mask='MASKFQPM'
+            else:
+                self.pupil_mask = None
 
         posangs, visit_ids, c_coron, files = (np.asarray(i) for i in [posangs, visit_ids, c_coron, files])
 
@@ -845,7 +852,7 @@ class SpaceConvolution:
                     self.inst_webbpsf.image_mask = self.image_mask                                                   
                     self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
             elif self.inst_webbpsf.name == 'MIRI':
-                if self.filt in ['F1065C', 'F1140C', 'F1550C']:
+                if self.inst_webbpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
                     self.inst_webbpsf.image_mask = 'FQPM'+self.filt[1:5]
                 elif self.inst_webbpsf.filter == 'F2300C':
                     self.inst_webbpsf.image_mask = 'LYOT2300'
