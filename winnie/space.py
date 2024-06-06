@@ -902,7 +902,6 @@ class SpaceConvolution:
 
         self.cropped_shape = cropped_shape
         if prefetch_psf_grid:
-            self._grid_fetched = True
             self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid, **psf_grid_kwargs)
         else:
             self._grid_fetched = False
@@ -960,7 +959,10 @@ class SpaceConvolution:
         pass
     
     
-    def fetch_psf_grid(self, recalc_psf_grid=False, grid_fn=generate_lyot_psf_grid, **grid_kwargs):
+    def fetch_psf_grid(self, recalc_psf_grid=False,
+                        grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
+                        transmission_map_fn=get_jwst_coron_transmission_map, transmission_map_kwargs={},
+                        grid_fn=generate_lyot_psf_grid, **grid_kwargs):
         if os.path.isfile(self.psf_file) and not recalc_psf_grid:
             with fits.open(self.psf_file) as hdul:
                 self.psfs = hdul[0].data
@@ -982,17 +984,25 @@ class SpaceConvolution:
         if self.blursigma != 0:
             self.psfs = gaussian_filter_sequence(self.psfs, self.blursigma*self.osamp)
             
-        coron_tmaps_osamp = []
-        psf_inds_osamp = []
-        for c_coron in self._c_coron_sci:
-            psf_inds = get_jwst_psf_grid_inds(c_coron, self.psf_offsets_polar, self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale)
-            coron_tmap = get_jwst_coron_transmission_map(self.inst_webbpsfext, c_coron, return_oversample=True, osamp=self.osamp, nd_squares=True, shape=(self._ny, self._nx))
-            
-            psf_inds_osamp.append(psf_inds)
-            coron_tmaps_osamp.append(coron_tmap)
+        if grid_inds_fn is not None:
+            psf_inds_osamp = []
+            for c_coron in self._c_coron_sci:
+                psf_inds = grid_inds_fn(c_coron, self.psf_offsets_polar, self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **grid_inds_kwargs)
+                psf_inds_osamp.append(psf_inds)
+            self._psf_inds_osamp = np.asarray(psf_inds_osamp)
+        else:
+            self._psf_inds_osamp = None
 
-        self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
-        self._psf_inds_osamp = np.asarray(psf_inds_osamp)
+        if transmission_map_fn is not None:
+            coron_tmaps_osamp = []
+            for c_coron in self._c_coron_sci:
+                coron_tmap = transmission_map_fn(self.inst_webbpsfext, c_coron, return_oversample=True, osamp=self.osamp, nd_squares=True, shape=(self._ny, self._nx), **transmission_map_kwargs)
+                coron_tmaps_osamp.append(coron_tmap)
+            self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
+        else:
+            self._coron_tmaps_osamp = None
+
+        self._grid_fetched = True
         self.set_crop(self.cropped_shape)
         pass
 
@@ -1157,6 +1167,12 @@ class SpaceReduction:
                 elif spacerdi is not None and output_ext is not None and spacerdi.concat is not None:
                     h0 = fits.getheader(spacerdi._files_sci[0], ext=0)
 
+                else:
+                    raise ValueError("""
+                    To load a saved SpaceReduction object, you must provide a) a file_to_load path, 
+                    b) a spacerdi object, output_ext, and concat, or c) a spacerdi object with a
+                                     concatenation already loaded and output_ext.      
+                    """)
                 file_to_load = '{}JWST_{}_{}_{}_{}_{}_{}.fits'.format(spacerdi.database.output_dir,
                                                                          h0['INSTRUME'],
                                                                          h0['DETECTOR'],

@@ -247,7 +247,7 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp, inst=None, shape=N
 
     rvals_all, thvals_all = psf_offsets_polar.copy()
 
-    rvals, thvals = np.unique(rvals_all), np.unique(thvals_all)
+    rvals = np.unique(rvals_all)
     
     yg, xg = c_to_c_osamp(np.indices((ny*osamp, nx*osamp), dtype=np.float64), 1/osamp)
 
@@ -261,17 +261,19 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp, inst=None, shape=N
         xmap_osamp, ymap_osamp = xy_polar_ang_displacement(xmap_osamp+c_coron[0]-c_star[0], ymap_osamp+c_coron[1]-c_star[1], -posang)
         xmap_osamp, ymap_osamp = xmap_osamp-c_coron[0]+c_star[0], ymap_osamp-c_coron[1]+c_star[1]
     
-    thvals_wrap0 = np.array([*thvals, *thvals])
-    thvals_wrap = np.array([*thvals, *(thvals+360.)])
-    
     rmap_osamp, tmap_osamp = webbpsf_ext.coords.xy_to_rtheta(xmap_osamp, ymap_osamp)
     tmap_osamp = np.mod(tmap_osamp, 360)
     rvals_px = rvals/pxscale.value
     
     nearest_rvals = rvals[np.argmin(np.array([np.abs(rmap_osamp-rval) for rval in rvals_px]), axis=0)]
-    nearest_thvals = thvals_wrap0[np.argmin(np.array([np.abs(tmap_osamp-thval) for thval in thvals_wrap]), axis=0)]
-    for i,(rval,thval) in enumerate(zip(rvals_all, thvals_all)):
-        psf_inds[(nearest_rvals == rval) & (nearest_thvals == thval)] = i
+    for rval in rvals:
+        thvals = np.unique(thvals_all[rvals_all == rval])
+        thvals_wrap0 = np.array([*thvals, *thvals])
+        thvals_wrap = np.array([*thvals, *(thvals+360.)])
+        nearest_thvals = thvals_wrap0[np.argmin(np.array([np.abs(tmap_osamp-thval) for thval in thvals_wrap]), axis=0)]
+        for thval in thvals:
+            i = np.where((thvals_all == thval)&(rvals_all == rval))[0][0]
+            psf_inds[(nearest_rvals == rval) & (nearest_thvals == thval)] = i
     return psf_inds
 
 
