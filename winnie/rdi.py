@@ -9,7 +9,7 @@ from .utils import (dist_to_pt, rotate_hypercube, pad_and_rotate_hypercube, free
 
 def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask=None, show_progress=False, posangs=None, cent=None, 
                   objective=False, zero_nans=False, use_gpu=False, ncores=-2, return_coeffs=False, coeffs_in=None, return_psf_model=False,
-                  pad_before_derot=False, opt_smoothing_fn=None, opt_smoothing_kwargs={}, err_hcube=None, err_hcube_ref=None):
+                  pad_before_derot=False, opt_smoothing_fn=None, opt_smoothing_kwargs={}, err_hcube=None, err_hcube_ref=None, large_arrs=False):
     """
     Performs RDI PSF subtraction using LOCI (Lafreniere et al. 2007). Using available keyword arguments, this function can be used to 
     perform:
@@ -28,7 +28,7 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
             4D image array to be PSF-subtracted; shape of (nT, nL, ny, nx) where nT is the number of exposures/integrations, 
             nL is the number of wavelengths, and ny & nx are the number of pixels in each spatial dimension.
             
-        hcube_ref: ndarray
+        hcube_ref: ndarray, large_arrs=large_arrs
             4D image array with shape (nT_ref, nL, ny, nx) where nT_ref is the number of reference
             exposures/integrations, and the remaining axes match those of hcube. 
             
@@ -45,7 +45,7 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
     Optional:
     
         hcube_css: ndarray
-            4D array; same shape as hcube. hcube_css should provide an estimate of the circumstellar signal 
+            4D array; same shape as hcube. hcube_css should provide an estimate of the circumstellar scene (CSS)
             in hcube, rotated to the appropriate posangs and convolved with the appropriate PSF.
             
         ref_mask: ndarray
@@ -113,6 +113,11 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
             is not None, the output err_hcube_res array will assume zero noise contribution from the PSF model (i.e., 
             for synthetic reference images).
 
+        large_arrs: bool
+            If True (and if use_gpu=False), PSF model reconstruction will use smaller parallelized calculations. If False,
+            larger vectorized calculations will be used instead. See the docstring for reconstruct_psf_model_cpu for more
+            information.
+
     ________
     Returns:
         Default:
@@ -148,9 +153,9 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
         return coeffs
 
     if objective:
-        psf_model = reconstruct_psf_model(hcube_ref_opt, coeffs, subzones, show_progress=show_progress, use_gpu=use_gpu, ncores=ncores)
+        psf_model, err_psf_model = reconstruct_psf_model(hcube_ref_opt, coeffs, subzones, show_progress=show_progress, use_gpu=use_gpu, ncores=ncores, err_hcube_ref=err_hcube_ref, large_arrs=large_arrs)
     else:
-        psf_model = reconstruct_psf_model(hcube_ref, coeffs, subzones, show_progress=show_progress, use_gpu=use_gpu, ncores=ncores)
+        psf_model, err_psf_model = reconstruct_psf_model(hcube_ref, coeffs, subzones, show_progress=show_progress, use_gpu=use_gpu, ncores=ncores, err_hcube_ref=err_hcube_ref, large_arrs=large_arrs)
 
     if return_psf_model:
         return psf_model
@@ -169,14 +174,8 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
 
     if err_hcube is None:
         err_hcube_res = None
-    else: # TODO: outsource to reconstruct_psf_model to consider use_gpu / ncores to speed this up.
-        err_hcube_psfmodel = np.zeros_like(err_hcube)
-        if err_hcube_ref is not None:
-            for i in range(hcube.shape[0]):
-                for j in range(hcube.shape[1]):
-                    lin_term_errs = (coeffs[j,0,i][:,np.newaxis,np.newaxis])*err_hcube_ref[:,j]
-                    err_hcube_psfmodel[i,j] = np.sqrt(np.sum(lin_term_errs**2, axis=0))
-        err_hcube_res = np.hypot(err_hcube, err_hcube_psfmodel)
+    else:
+        err_hcube_res = np.hypot(err_hcube, err_psf_model)
         if posangs is not None:
             if pad_before_derot:
                 err_hcube_res, _ = pad_and_rotate_hypercube(err_hcube_res, -posangs, cent=cent, ncores=ncores, use_gpu=use_gpu, cval0=np.nan)
@@ -191,69 +190,120 @@ def compute_rdi_coefficients(hcube, hcube_ref, optzones, show_progress=False, re
     nT, nL, _, _ = hcube.shape  # N_theta by N_lambda by N_y by N_x
     nT_ref = hcube_ref.shape[0]
     nR = len(optzones) # N_regions
-    coeff_hcube = np.zeros((nL, nR, nT, nT_ref), dtype=hcube.dtype)  # Array for storing coefficients
-    R_iterator = tqdm(range(nR), desc='Coefficient calculation (regions)', leave=False) if show_progress else range(nR)
-    L_iterator = tqdm(range(nL), desc='Coefficient calculation (wavelengths)', leave=False) if (show_progress and nL>1) else range(nL)
-    T_iterator = tqdm(range(nT), desc='Coefficient calculation (exposures)', leave=False) if show_progress else range(nT)
-    for Ri in R_iterator:  # Outermost loop over subsections; this iteration order ends up being more time efficient here:
+    coeff_hcube = np.zeros((nR, nT, nT_ref, nL), dtype=hcube.dtype)  # Array for storing coefficients
+    R = tqdm(range(nR), desc='Coefficient calculation (regions)', leave=False) if show_progress else range(nR)
+    L = tqdm(range(nL), desc='Coefficient calculation (wavelengths)', leave=False) if (show_progress and nL>1) else range(nL)
+    T = tqdm(range(nT), desc='Coefficient calculation (exposures)', leave=False) if show_progress else range(nT)
+    for Ri in R:  # Outermost loop over subsections; this iteration order ends up being more time efficient here
         opt_i = optzones[Ri]  # opt_i is the ny by nx boolean array indicating which pixels are in the region.
-        tararrs = hcube[:, :, opt_i].copy() # This turns our masked nT*nL*ny*nx array into an nT*nL*nP array, where nP is the number of pixels in the optimization region.
-        refarrs = hcube_ref[:, :, opt_i].copy()  # This turns our masked nT_ref*nL*ny*nx array into an nT_ref*nL*nP array, where nP is the number of pixels in the optimization region.
+        tararrs = hcube[..., opt_i].copy() # This turns our masked nT*nL*ny*nx array into an nT*nL*nP array, where nP is the number of pixels in the optimization region.
+        refarrs = hcube_ref[..., opt_i].copy()  # This turns our masked nT_ref*nL*ny*nx array into an nT_ref*nL*nP array, where nP is the number of pixels in the optimization region.
         if ref_mask is not None:
             refarrs = refarrs[ref_mask[Ri]]
         optmats = refarrs.transpose((1, 0, 2)) @ tararrs.transpose((1, 2, 0))# carries out matrix inversion of all wavelength channels at once, giving a matrix of shape (nL, nT_ref, nT)
         refmats = refarrs.transpose((1, 0, 2)) @ refarrs.transpose((1, 2, 0))# carries out matrix inversion of all wavelength channels at once, giving a matrix of shape (nL, nT_ref, nT_ref)
-        for Li in L_iterator:  # Second loop over wavelengths:
+        for Li in L:  # Second loop over wavelengths
             optmat = optmats[Li]  # The (nT_ref, nT) matrix for this wavelength
             refmat = refmats[Li]  # The (nT_ref, nT_ref) matrix for this wavelength
             lu, piv = linalg.lu_factor(refmat)  # Since we aren't excluding frames as in ADI/SDI, we just need to run this once per wavelength.
-            for Ti in T_iterator:  # Final loop over par ang / time axis (individual science exposures):
+            for Ti in T:  # Final loop over integrations / exposures
                 tararr = optmat[:,Ti]  # 1d vector of length equal to nT_ref
                 if ref_mask is not None:
-                    coeff_hcube[Li, Ri, Ti, ref_mask[Ri]] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
+                    coeff_hcube[Ri, Ti, ref_mask[Ri], Li] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
                 else:
-                    coeff_hcube[Li, Ri, Ti] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
+                    coeff_hcube[Ri, Ti, :, Li] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
     return coeff_hcube
 
 
-def reconstruct_psf_model(hcube_ref, coeffs, subzones, show_progress=False, use_gpu=False, ncores=-2):
+def reconstruct_psf_model(hcube_ref, coeffs, subzones, show_progress=False, use_gpu=False, ncores=-2, err_hcube_ref=None, large_arrs=False):
     if use_gpu:
-        hcube_psfmodel = reconstruct_psf_model_gpu(hcube_ref, coeffs, subzones, show_progress=show_progress)
+        hcube_psfmodel, err_hcube_psfmodel = reconstruct_psf_model_gpu(hcube_ref, coeffs, subzones, show_progress=show_progress, err_hcube_ref=err_hcube_ref)
     else:
-        hcube_psfmodel = reconstruct_psf_model_cpu(hcube_ref, coeffs, subzones, show_progress=show_progress, ncores=ncores)
-    return hcube_psfmodel
+        hcube_psfmodel, err_hcube_psfmodel = reconstruct_psf_model_cpu(hcube_ref, coeffs, subzones, show_progress=show_progress, ncores=ncores, large_arrs=large_arrs, err_hcube_ref=err_hcube_ref)
+    return hcube_psfmodel, err_hcube_psfmodel
 
 
-def reconstruct_psf_model_cpu(hcube_ref, coeffs, subzones, show_progress=False, ncores=-2):
-    _, _, ny, nx = hcube_ref.shape # Number of: images, wavelengths, y-pixels, and x-pixels
-    nL, nR, nT, _ = coeffs.shape
+def reconstruct_psf_model_cpu(hcube_ref, coeffs, subzones, show_progress=False, ncores=-2, err_hcube_ref=None, large_arrs=False):
+    """
+    Note: for smaller datasets, large_arrs=False will result in roughly an
+        order of magnitude speedup. However, the behavior with large_arrs=False
+        may be prohibitively resource intensive for large datasets and/or when
+        using zones with a large number of pixels. 
+        
+        E.g., for full-frame RDI of an IFS sequence with 200 science exposures
+        and 50 reference exposures, each of shape [100x512x512], c_i*I_i will
+        produce an array containing [200 x 50 x 100 x 512 x 512] elements. This
+        is >2 TB of data, so will very likely exceed the available memory for
+        your system. Using large_arrs=True will split this to 200 operations,
+        each producing ~10 GB arrays instead. These operations will be run in
+        parallel over ncores processes at a time.
+
+        For reference, each case requires memory to support approximately the
+        following number of elements (in addition to the size of the input
+        data):
+
+            large_arrs = True: ncores x nref x nwavelengths x ny x nx
+            
+            large_arrs = False:  nsci x nref x nwavelengths x ny x nx
+    """
+    _, _, ny, nx = hcube_ref.shape # Number of reference images, wavelengths, y-pixels, and x-pixels
+    nR, nT, _, nL = coeffs.shape # regions, science images, reference images, wavelengths
     hcube_psfmodel = np.zeros((nT, nL, ny, nx), dtype=hcube_ref.dtype) + np.nan # Array in which to place reconstructed model
+
+    calc_err = err_hcube_ref is not None
+    err_hcube_psfmodel = (np.zeros_like(hcube_psfmodel) + np.nan if calc_err else None)
+
     for Ri in tqdm(range(nR), desc='PSF model reconstruction (regions)', leave=False) if show_progress else range(nR): # Iterate over regions
         sub_i = subzones[Ri] # An ny by nx boolean mask indicating which pixels are being considered
-        imvals = hcube_ref[:, :, sub_i].T.copy() # Fetching the pixels in the subzone, dimensions of nT_ref x nL x npx
-        T = tqdm(range(nT), desc='PSF model reconstruction (exposures)', leave=False) if show_progress else range(nT)
-        nT_results = Parallel(n_jobs=ncores, prefer='threads')(delayed(np.sum)(coeffs[np.newaxis, :, Ri, Ti].copy()*imvals, -1) for Ti in T)
-        for Ti in range(nT): # Iterate over target images, building the PSF model (in the subzone) for each.
-            hcube_psfmodel[Ti, :, sub_i] = nT_results[Ti]
-    return hcube_psfmodel
+        I_i = hcube_ref[:, :, sub_i].copy() # Fetching the pixels in the subzone, dimensions of nT_ref x nL x npx
+        c_i = coeffs[Ri, ..., np.newaxis].copy() # Fetch the appropriate coefficients, dimensions of nT x nT_ref x nL x 1
+        if calc_err:
+            dI_i = err_hcube_ref[:, :, sub_i].copy()
+        if large_arrs: 
+            T = tqdm(range(nT), desc='PSF model reconstruction (exposures)', leave=False) if show_progress else range(nT)
+            hcube_psfmodel[..., sub_i] = Parallel(n_jobs=ncores, prefer='threads')(delayed(np.sum)(c_i[Ti]*I_i, 0) for Ti in T)
+            if calc_err:
+                err_hcube_psfmodel[..., sub_i] = np.sqrt(Parallel(n_jobs=ncores, prefer='threads')(delayed(np.sum)((c_i[Ti]*dI_i)**2, 0) for Ti in T))
+        else:
+            hcube_psfmodel[..., sub_i] = np.sum(c_i*I_i, axis=1)
+            if calc_err:
+                err_hcube_psfmodel[..., sub_i] = np.sqrt(np.sum((c_i*dI_i)**2, axis=1))
+            
+    return hcube_psfmodel, err_hcube_psfmodel
 
 
-def reconstruct_psf_model_gpu(hcube_ref, coeffs, subzones, show_progress=False):
+def reconstruct_psf_model_gpu(hcube_ref, coeffs, subzones, show_progress=False, err_hcube_ref=None):
     cp_hcube_ref = cp.array(hcube_ref)
     cp_coeffs = cp.array(coeffs)
     cp_subzones = cp.array(subzones)
     _, _, ny, nx = cp_hcube_ref.shape # Number of: images, wavelengths, y-pixels, and x-pixels
     nL, nR, nT, _ = cp_coeffs.shape
     hcube_psfmodel = cp.zeros((nT, nL, ny, nx))+np.nan # Array in which to place reconstructed model
+
+    calc_err = err_hcube_ref is not None
+    if calc_err:
+        cp_err_hcube_ref = cp.array(err_hcube_ref)
+        err_hcube_psfmodel = cp.zeros_like(hcube_psfmodel)+np.nan
+
     for Ri in tqdm(range(nR), desc='PSF model reconstruction (regions)', leave=False) if show_progress else range(nR):
         sub_i = cp_subzones[Ri] # An ny by nx boolean mask indicating which pixels are being considered
-        imvals = cp_hcube_ref[:, :, sub_i].transpose((1,0,2)) # Fetching the pixels in the subzone, dimensions of nT_ref x nL x npx
+        I_i = cp_hcube_ref[:, :, sub_i].transpose((1,0,2)) # Fetching the pixels in the subzone, dimensions of nT_ref x nL x npx
+        if calc_err:
+            dI_i = cp_err_hcube_ref[:, :, sub_i].transpose((1,0,2))
         for Ti in tqdm(range(nT), desc='PSF model reconstruction (exposures)', leave=False) if show_progress else range(nT): # Iterate over target images, building the PSF model (in the subzone) for each.
-            cvals = cp_coeffs[:, Ri, Ti, :, cp.newaxis] # Fetch the appropriate coefficients
-            hcube_psfmodel[Ti, :, sub_i] = cp.sum(cvals*imvals, axis=1) # Multiply images by the coefficients, then sum along the nT axis to get the model values.
+            c_I = cp_coeffs[:, Ri, Ti, :, cp.newaxis] # Fetch the appropriate coefficients
+            hcube_psfmodel[Ti, :, sub_i] = cp.sum(c_I*I_i, axis=1) # Multiply images by the coefficients, then sum along the nT axis to get the model values.
+            if calc_err:
+                err_hcube_psfmodel[Ti, :, sub_i] = cp.sqrt(cp.sum((c_I*dI_i)**2, axis=1))
+
     hcube_psfmodel_np = cp.asnumpy(hcube_psfmodel) # Convert output back to numpy
-    hcube_psfmodel, cp_hcube_ref, cp_coeffs, cp_subzones, cvals = free_gpu(hcube_psfmodel, cp_hcube_ref, cp_coeffs, cp_subzones, cvals) # Explicitly clear VRAM for cupy arrays
-    return hcube_psfmodel_np
+    hcube_psfmodel, cp_hcube_ref, cp_coeffs, cp_subzones, c_I = free_gpu(hcube_psfmodel, cp_hcube_ref, cp_coeffs, cp_subzones, c_I) # Explicitly clear VRAM for cupy arrays
+    if calc_err:
+        err_hcube_psfmodel_np = cp.asnumpy(err_hcube_psfmodel)
+        err_hcube_psfmodel, cp_err_hcube_ref = free_gpu(err_hcube_psfmodel, cp_err_hcube_ref)
+    else:
+        err_hcube_psfmodel_np = None
+    return hcube_psfmodel_np, err_hcube_psfmodel_np
 
 
 def median_combine_sequence(hcube, use_gpu=False, axis=0):
@@ -393,7 +443,7 @@ def build_annular_rdi_zones(nx, ny, cent, r_opt=None, r_sub=None, pxscale=None, 
     if r_sub is None:
         r_sub = deepcopy(r_opt)
         r_sub[0][0] = 0
-        r_sub[-1][1] = np.inf
+        r_sub[-1][1] = int(np.ceil(np.max(rmap)) + 1)
     elif np.ndim(r_sub) == 0: # If a single value
         r_sub = [[0, r_sub]]
     elif np.ndim(r_sub) == 1: # If a single lower and upper limit

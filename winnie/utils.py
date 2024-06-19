@@ -274,12 +274,12 @@ def pad_or_crop_about_pos(im, pos, new_size, new_cent=None, cval=np.nan, order=3
     return im_out
 
 
-def crop_data(data, cent, new_shape, return_indices=False):
+def crop_data(data, cent, new_shape, return_indices=False, copy=True):
     new_ny, new_nx = new_shape
     x0, y0 = cent
     x1, y1 = max(0, int(np.round(x0-(new_nx-1.)/2.))), max(0, int(np.round(y0-(new_ny-1.)/2.)))
     x2, y2 = x1+new_nx, y1+new_ny
-    data_cropped = data[..., y1:y2, x1:x2].copy()
+    data_cropped = (data[..., y1:y2, x1:x2].copy() if copy else data[..., y1:y2, x1:x2])
     new_cent = np.array([x0-x1, y0-y1])
     if return_indices:
         return data_cropped, new_cent, [y1,y2,x1,x2]

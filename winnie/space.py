@@ -124,24 +124,28 @@ class SpaceRDI:
         
     def load_concat(self, concat, coron_offsets=None, cropped_shape=None):
         """
-        Load data for an indicated concatenation in preparation for an RDI reduction. By default,
-        this prepares simple annular optimization zones for PSF-subtraction. After running load_concat,
-        these zones can be changed as you prefer using the set_zones method.
+        Load data for an indicated concatenation in preparation for an RDI
+        reduction. By default, this prepares simple annular optimization zones
+        for PSF-subtraction. After running load_concat, these zones can be
+        changed as you prefer using the set_zones method.
         
         Parameters
         ----------
         concat: str or int
-            Either the full concatenation string or the index of the desired concatenation. 
+            Either the full concatenation string or the index of the desired
+            concatenation. 
 
         coron_offsets: array
-            Array of shape (Nobs, 2), providing the offset of the coronagraph from the star
-            (in pixels) for each file contained in the concatenation table. To be used for data
-            that have been aligned but lack the spaceklip alignment header info.
+            Array of shape (Nobs, 2), providing the offset of the coronagraph
+            from the star (in pixels) for each file contained in the
+            concatenation table. To be used for data that have been aligned but
+            lack the spaceklip alignment header info.
 
         cropped_shape: array or tuple
-            Spatial dimensions to which data should be cropped as [ny,nx]. Can be set later or 
-            returned to original shape using the set_crop method. Cropping is primarily for improving
-            runtimes during forward modeling.
+            Spatial dimensions to which data should be cropped, as [ny,nx]. Can
+            be set later or returned to original shape using the set_crop
+            method. Cropping is primarily for improving runtimes during forward
+            modeling.
         """
         if isinstance(concat, numbers.Number):
             concat_str = list(self.database.obs.keys())[concat]
@@ -176,7 +180,7 @@ class SpaceRDI:
         visit_ids = []
         c_coron = []
         dates = []
-
+        self._coron_offsets = []
         for i,f in enumerate(files):
             with fits.open(f, lazy_load_hdus=True) as hdul:
                 ints = hdul[1].data
@@ -205,7 +209,9 @@ class SpaceRDI:
             visit_ids.append(h0['VISIT_ID'])
             c_coron.append(self._c_star-offset)
             dates.append(h0['DATE-BEG'])
+            self._coron_offsets.append(offset)
         
+        self._coron_offsets = np.array(self._coron_offsets)
         self._image_mask = h0['CORONMSK'].replace('MASKA', 'MASK')
         if 'PUPIL' in h0:
             self._pupil_mask = h0['PUPIL']
@@ -234,15 +240,14 @@ class SpaceRDI:
         
         if self.pad_data is not None: self._apply_padding()
 
-        self._csscube = None
+        self._imcube_css = None
+        self.imcube_css = None
         self.cropped_shape = None
         
         self.fixed_rdi_settings = {}
 
         # Setting initial annular zones for RDI procedure based on set defaults.
-        optzones, subzones = build_annular_rdi_zones(self._nx, self._ny, self._c_star, r_opt=self.r_opt, r_sub=self.r_sub, pxscale=self.pxscale)
-
-        self.set_zones(optzones, subzones)
+        self.update_annular_zones(exclude_opt_nans=True)
 
         self.set_crop(cropped_shape)
 
@@ -294,7 +299,7 @@ class SpaceRDI:
 
         if cropped_shape is not None:
             self.cropped_shape = np.asarray(cropped_shape)
-            self.imcube_sci, self.c_star, self._crop_indices = crop_data(self._imcube_sci, self._c_star, self.cropped_shape, return_indices=True)
+            self.imcube_sci, self.c_star, self._crop_indices = crop_data(self._imcube_sci, self._c_star, self.cropped_shape, return_indices=True, copy=False)
             y1, y2, x1, x2 = self._crop_indices
             self.errcube_sci = (None if self._errcube_sci is None else self._errcube_sci[..., y1:y2, x1:x2])
             self.imcube_ref = self._imcube_ref[..., y1:y2, x1:x2]
@@ -304,10 +309,10 @@ class SpaceRDI:
             self.c_coron_sci = self._c_coron_sci - np.array([x1,y1])
             self.c_coron_ref = self._c_coron_ref - np.array([x1,y1])
             self.ny, self.nx = self.cropped_shape
+            if self._imcube_css is not None:
+                self.imcube_css = self._imcube_css[..., y1:y2, x1:x2]
 
         else: # Set cropped data to non-cropped
-            self._crop_indices = [0, self._ny+1, 0, self._nx+1]
-            self.cropped_shape = cropped_shape
             self.imcube_sci = self._imcube_sci
             self.errcube_sci = self._errcube_sci
             self.imcube_ref = self._imcube_ref
@@ -317,7 +322,11 @@ class SpaceRDI:
             self.c_coron_ref = self._c_coron_ref
             self.optzones = self._optzones
             self.subzones = self._subzones
-            self.ny, self.nx = self._ny, self._nx 
+            self.ny, self.nx = self._ny, self._nx
+            self._crop_indices = [0, self._ny+1, 0, self._nx+1]
+            self.cropped_shape = cropped_shape
+            if self._imcube_css is not None:
+                self.imcube_css = self._imcube_css
     
         if self.convolver is not None:
             self.convolver.set_crop(cropped_shape)
@@ -328,45 +337,77 @@ class SpaceRDI:
                 forward_model=False, collapse_rolls=True, derotate=True,
                 **extra_rdi_settings):
         """
-        This is functionally a JWST-centric wrapper for the winnie.rdi.rdi_residuals function.
+        Runs winnie.rdi.rdi_residuals using settings stored in the SpaceRDI
+        object's rdi_settings property. Returns a SpaceReduction object
+        containing the residuals and other products. If save_products is True,
+        the products are saved to a FITS file in the output directory specified
+        in the input SpaceKLIP database object.
 
         Parameters
         ----------
-
         save_products: bool
             If True, saves the output products to a FITS file.
         
         return_res_only: bool
-            If True, directly returns the result of rdi_residuals (useful for debugging or other advanced analysis).
+            If True, directly returns the result of rdi_residuals (useful for
+            debugging or other advanced analysis).
 
         forward_model: bool
-            If True, runs forward modeling on the circumstellar model set using set_circumstellar_model and with the current RDI
-            configuration.
+            If True, runs forward modeling on the circumstellar model set using
+            set_circumstellar_model and with the current RDI configuration.
 
         collapse_rolls: bool
-            If True, returns the residuals for each distinct pointing (derotated if derotate=True). In most cases, this just means 
-            returning both of the PSF-subtracted exposures. However, for NIRCam dual channel obs where one filter is paired with two
-            or more filters for the other channel (e.g., F210M + F335M followed by F210M + F444W), the result is multiple exposures
-            per roll for a given filter. In this case, the residuals are averaged together for each roll.
+            If True, returns the residuals for each distinct pointing
+            (derotated if derotate=True). In most cases, this just means
+            returning both of the PSF-subtracted exposures. However, for NIRCam
+            dual channel obs where one filter is paired with two or more
+            filters for the other channel (e.g., F210M + F335M followed by
+            F210M + F444W), the result is multiple exposures per roll for a
+            given filter. In this case, the residuals are averaged together for
+            each roll.
         
         derotate: bool
-            If True, derotates the residuals to a common north up orientation. If False, returns residuals in the original orientation.
+            If True, derotates the residuals to a common north up orientation.
+            If False, returns residuals in the original orientation.
         
         extra_rdi_settings:
-            Additional settings to pass to winnie.rdi.rdi_residuals. If any of these is already contained in the rdi_settings attribute,
-            an error will be raised.
+            Additional settings to pass to winnie.rdi.rdi_residuals. If any of
+            these is already contained in the rdi_settings attribute, an error
+            will be raised.
+
+        Returns
+        -------
+        products: SpaceReduction object
+            Object containing the residuals and other products from the RDI
+            procedure. If collapse_rolls is True, the object will contain
+            residuals for each roll (products.rolls) as well as a
+            median-combined residual image (products.im). If the prop_err
+            attribute is True, the object will also contain the propagated
+            error arrays for the residuals (products.err and
+            products.err_rolls).
         """
         if self.concat is None:
-            raise ValueError("""Prior to executing "run_rdi", you must load a
-            concatenation using the load_concat method.""")
-        
+            raise ValueError("""
+                Prior to executing "run_rdi", you must load a concatenation
+                using the load_concat method.
+                             """)
         output_ext = copy(self.output_ext)
         if forward_model:
-            if self._csscube is None:
-                raise ValueError("""Prior to executing "run_rdi" with forward_model=True
-                you must first set a circumstellar model using 
-                "set_circumstellar_model"!""")
-            imcube_sci = self._csscube
+            if (('coeffs_in' in self.rdi_settings and self.rdi_settings['coeffs_in'] is not None) 
+                or ('coeffs_in' in extra_rdi_settings and extra_rdi_settings['coeffs_in'] is not None)):
+                raise ValueError("""
+                    Forward modeling with run_rdi is not valid when using fixed
+                    RDI coefficients. For classical RDI, the output from the
+                    derotate_and_combine_cssmodel method is likely more
+                    appropriate.
+                    """)
+            if self.imcube_css is None:
+                raise ValueError("""
+                    Prior to executing "run_rdi" with forward_model=True you
+                    must first set a circumstellar model using the
+                    set_circumstellar_model method.
+                                 """)
+            imcube_sci = self.imcube_css
             prop_err = False # Never propagate error when forward modeling
             output_ext = output_ext + '_fwdmod'
         else:
@@ -438,22 +479,55 @@ class SpaceRDI:
                 products.save(overwrite=self.overwrite)
             except OSError:
                 raise OSError("""
-                      A FITS file for this output_ext + output_dir + concat already exists!
-                      To overwrite existing files, set the overwrite attribute for your WinnieSpaceRDI
-                      instance to True. Alternatively, either change the output_ext attribute
-                      for your WinnieRDI instance, or select a different output directory when 
-                      initializing your SpaceKLIP database object.
+                      A FITS file for this output_ext + output_dir + concat
+                      already exists! To overwrite existing files, set the
+                      overwrite attribute for your WinnieSpaceRDI instance to
+                      True. Alternatively, either change the output_ext
+                      attribute for your WinnieRDI instance, or select a
+                      different output directory when initializing your
+                      SpaceKLIP database object.
                       """)
         return products
 
     
     def set_zones(self, optzones, subzones, exclude_opt_nans=True):
+        """
+        Set the optimization and subtraction zones for RDI PSF-subtraction. See
+        winnie.rdi.rdi_residuals for more information on the format and
+        function of optzones and subzones. 
+
+        ___________
+        Parameters:
+
+        optzones: ndarray
+            Optimization zones for the reduction. 
+        subzones: ndarray
+            Subtraction zones for the reduction.
+        exclude_opt_nans: bool
+            If True, excludes from the optimization zones any pixels that are
+            NaN in either the science or reference data.
+
+        Raises:
+
+            ValueError: If some pixels are included in multiple subtraction zones.
+
+        Notes: 
+
+        - If the spatial dimensions of the zones match those of the uncropped
+          data, the zones are directly assigned.
+         
+        - If the zones are already cropped, the corresponding uncropped zones
+          are constructed from them.
+        
+        """
         if np.any(subzones.sum(axis=0) > 1):
             raise ValueError("Subtraction zones are invalid; some pixels are included in multiple subtraction zones.")
+        
         # If spatial dims of zones match those of the uncropped data:
         if np.all(np.asarray(optzones.shape[-2:]) == np.asarray(self._imcube_sci.shape[-2:])):
             self._optzones = np.asarray(optzones)
             self._subzones = np.asarray(subzones)
+            
             if self.cropped_shape is not None: # For changing zones after cropping
                 y1, y2, x1, x2 = self._crop_indices
                 self.optzones = self._optzones[..., y1:y2, x1:x2]
@@ -488,8 +562,30 @@ class SpaceRDI:
                 self.optzones = self._optzones
         pass
 
-    
+
+    def update_annular_zones(self, exclude_opt_nans=True):
+        """
+        Set annular RDI zones based on current values for self.r_opt and
+        self.r_sub.
+
+        ___________
+        Parameters:
+
+        exclude_opt_nans: bool
+            If True, excludes from the optimization zones any pixels that are
+            NaN in either the science or reference data.
+        """
+        optzones, subzones = build_annular_rdi_zones(self._nx, self._ny, self._c_star, r_opt=self.r_opt, r_sub=self.r_sub, pxscale=self.pxscale)
+        self.set_zones(optzones, subzones, exclude_opt_nans=exclude_opt_nans)
+        pass
+
+
     def report_current_config(self, show_plots=None):
+        """
+        Print a summary of the current configuration of the SpaceRDI instance.
+        If show_plots is True, also plots the current optimization and
+        subtraction zones for the first science exposure.
+        """
         if show_plots is None:
             show_plots = self.show_plots
         print(self.concat)
@@ -525,6 +621,54 @@ class SpaceRDI:
     
     
     def set_fixed_rdi_settings(self, **settings):
+        """
+        Set RDI settings that will be added to (and overwrite where duplicated)
+        any settings managed by set_presets, rdi_presets, hpfrdi_presets, or
+        mcrdi_presets. These must be re-set if a new concatenation is loaded.
+
+        Some settings that may be useful:
+        
+        ref_mask: ndarray
+            2D boolean array of shape (len(optzones), len(self.imcube_ref))
+            that indicates which reference images should be considered for
+            which optimization regions. E.g., if ref_mask[i,j] is False, then
+            for the ith optimization zone (optzones[i]), the jth reference
+            image (imcube_ref[j]) will NOT be used for construction of the PSF
+            model. This can be useful if some reference exposures have
+            anomalous features that make them problematic for some regions
+            while still being suitable for others; e.g., an image with a bright
+            background source near the edge of the FOV may still be useful for
+            nulling the PSF near the inner working angle.
+
+        zero_nans: bool
+            If True, any nans in the optimization zones will be replaced with
+            zeros for the procedure.
+
+        return_coeffs: bool
+            If True, returns only the array of PSF model coefficients.
+
+        coeffs_in: ndarray
+            If provided, these coefficients will be used to construct the PSF
+            model instead of computing coefficients.
+
+        opt_smoothing_fn: callable or None
+            If not None, this argument indicates the function with which to
+            smooth the sequences. This should be a function that takes a
+            hypercube along with some keyword arguments and returns a smoothed
+            hypercube, i.e.: hcube_filt = opt_smoothing_fn(hcube,
+            **opt_smoothing_kwargs).
+            
+        opt_smoothing_kwargs: dict
+            If opt_smoothing_fn is not None, arguments to pass to
+            opt_smoothing_fn when it is called.
+
+        large_arrs: bool
+            If True (and if use_gpu=False), PSF model reconstruction will use
+            smaller parallelized calculations. If False, larger vectorized
+            calculations will be used instead. See the docstring for
+            winnie.rdi.reconstruct_psf_model_cpu for more information. Default
+            is False.
+        """
         self.fixed_rdi_settings = settings
         self.rdi_settings.update(self.fixed_rdi_settings)
         pass
@@ -533,10 +677,9 @@ class SpaceRDI:
     def set_presets(self, presets={}, output_ext='psfsub'):
         """
         Generic method to quickly assign a set of arguments to use for
-        winnie.rdi.rdi_residuals, while also setting the extension for
-        saved files, repopulating any settings in
-        self.fixed_rdi_settings, and reporting the configuration 
-        if verbose is True.
+        winnie.rdi.rdi_residuals, while also setting the extension for saved
+        files, repopulating any settings in self.fixed_rdi_settings, and
+        reporting the configuration if verbose is True.
         """
         self.output_ext = output_ext
         self.rdi_settings = presets
@@ -547,11 +690,38 @@ class SpaceRDI:
     
     
     def rdi_presets(self, output_ext='rdi_psfsub'):
+        """
+        Set presets to perform a standard RDI reduction.
+
+        ___________
+        Parameters:
+            output_ext (str, optional): Output file extension for FITS
+                products. Defaults to 'rdi_psfsub'.
+        """
         self.set_presets(presets={}, output_ext=output_ext)
         pass
     
     
     def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub'):
+        """
+        Set presets for High-Pass Filtering RDI (HPFRDI), in which coefficients
+        are computed by comparing high-pass filtered science and reference
+        data.
+
+        ___________
+        Parameters:
+            filter_size (float, optional): Size of the high-pass filter. If not
+                provided, it defaults to the value of self._sigma.
+            filter_size_adj (float, optional): Adjustment factor for the filter
+                size. Defaults to 1. output_ext (str, optional): Output file
+                extension for FITS products. Defaults to 'hpfrdi_psfsub'.
+
+        Notes:
+            - This method checks if there will be any NaN values in the
+              optimization zones after applying the specified filtering.
+            - If so, it also sets 'zero_nans' to True to avoid a crash when
+              run_rdi is called.
+        """
         if filter_size is None:
             filter_size = self._sigma
         presets = {}
@@ -570,26 +740,131 @@ class SpaceRDI:
     
     
     def mcrdi_presets(self, output_ext='mcrdi_psfsub'):
-        if self._csscube is None:
+        """
+        Set presets for Model Constrained RDI (MCRDI), in which coefficients
+        are computed by comparing reference data to science data from which an
+        estimate of the circumstellar scene has been subtracted.
+
+        ___________
+        Parameters:
+            output_ext (str, optional): Output file extension for FITS
+                products. Defaults to 'mcrdi_psfsub'.
+
+        Raises:
+            ValueError: If a circumstellar model has not been set using the
+                set_circumstellar_model method.
+        """
+        if self.imcube_css is None:
             raise ValueError(
-                    """
-                    Prior to executing mcrdi_presets,
-                    you must first set a circumstellar model using 
-                    set_circumstellar_model.
-                    """)
-            
-        self.set_presets(presets={'hcube_css':self._csscube[:, np.newaxis]},
+                """
+                Prior to executing mcrdi_presets,
+                you must first set a circumstellar model using 
+                set_circumstellar_model.
+                """)
+
+        self.set_presets(presets={'hcube_css': self.imcube_css[:, np.newaxis]},
                          output_ext=output_ext)
         pass
     
 
-    def prepare_convolution(self, source_spectrum=None, reference_index=None, coron_offsets=None,
-                            fov_pixels=151, osamp=2, output_ext='psfs', prefetch_psf_grid=True, 
-                            recalc_psf_grid=False, psf_grid_kwargs={}, psfgrids_output_dir='psfgrids',
-                            fetch_opd_by_date=True):
+    def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
+                            output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
+                            psfgrids_output_dir='psfgrids', fetch_opd_by_date=True, 
+                            grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
+                            grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
+                            transmission_map_fn=get_jwst_coron_transmission_map,
+                            transmission_map_kwargs={}):
+        """
+        Sets up the SpaceRDI instance to enable convolution of circumstellar
+        scene models by preparing an instance of the SpaceConvolution class and
+        assigning it to the convolver attribute. Arguments are stored in the
+        convolver_args attribute, where they can be altered as preferred before
+        loading a new concatenation.
 
-        convolver_args = dict(reference_index=reference_index, coron_offsets=coron_offsets, fov_pixels=fov_pixels, osamp=osamp, output_ext=output_ext,
-                                            prefetch_psf_grid=prefetch_psf_grid, recalc_psf_grid=recalc_psf_grid, psf_grid_kwargs=psf_grid_kwargs)
+        ___________
+        Parameters:
+
+        source_spectrum : synphot.spectrum.SourceSpectrum, optional
+            The source spectrum to use for generating PSFs for convolution.
+        reference_index : int, optional
+            The index of the science exposure that will be used to initialize
+            the WebbPSF instrument object with WebbPSF's
+            setup_sim_to_match_file function.
+        fov_pixels : int, optional
+            The number of pixels in the field of view. Default is 151.
+        osamp : int, optional
+            The oversampling factor to use for generating PSFs. Default is 2.
+        output_ext : str, optional
+            The file extension for the output PSFs. Default is 'psfs'.
+        prefetch_psf_grid : bool, optional
+            Whether to fetch the PSF grid immediately after a concatenation is
+            loaded, or wait for manual fetching by the user. Default is True.
+        recalc_psf_grid : bool, optional
+            Whether to recalculate the PSF grid if it has already been
+            generated and saved. Default is False.
+        psfgrids_output_dir : str, optional
+            The directory for saving the PSF grids (relative to the output
+            direction for the initial SpaceKLIP database). Default is
+            'psfgrids'.
+        fetch_opd_by_date : bool, optional
+            Whether to fetch the OPD map for the date of the observations or
+            use the default. Default is True.
+        grid_fn : callable, optional
+            The function to use for generating the PSF grid. Default is
+            winnie.convolution.generate_lyot_psf_grid.
+        grid_kwargs : dict, optional
+            Additional keyword arguments to be passed to grid_fn.
+        grid_inds_fn : callable, optional
+            The function to use for matching model pixels to PSF grid samples.
+            Default is winnie.convolution.get_jwst_psf_grid_inds.
+        grid_inds_kwargs : dict, optional
+            Additional keyword arguments to be passed to grid_inds_fn.
+        transmission_map_fn : callable, optional
+            The function to use for generating the coronagraph transmission
+            map. Default is winnie.convolution.get_jwst_coron_transmission_map.
+        transmission_map_kwargs : dict, optional
+            Additional keyword arguments to be passed to transmission_map_fn.
+
+        Notes:
+        - grid_fn should return three objects: 1) a 3D array of PSF samples, 2)
+          the 2D array of shape (2,N) containing the polar coordinates of those
+          samples (relative to the coronagraph center; units of [arcsec,
+          degrees]), and 3) the 2D array of shape (2,N) containing the
+          cartesian coordinates of those samples (relative to the coronagraph
+          center; units of [arcsec, arcsec]). It should take a WebbPSF
+          instrument object as the first argument, and must have the following
+          signature: 
+                grid_fn(inst_webbpsf, source_spectrum=None, shift=None,
+                osamp=2, fov_pixels=151, show_progress=True, **grid_kwargs)
+          See winnie.convolution.generate_lyot_psf_grid for documentation
+          regarding these arguments.
+
+        - grid_inds_fn should return a 2D integer array of shape (ny*osamp,
+          nx*osamp) where each pixel provides the index of the PSF sample that
+          should be used for convolution of that pixel. It should have the
+          following signature:
+                grid_inds_fn(c_coron, psf_offsets_polar, osamp=2, shape=None,
+                pxscale=None, **grid_inds_kwargs)
+          See winnie.convolution.get_jwst_psf_grid_inds for documentation
+          regarding these arguments.
+
+        - transmission_map_fn should return a 2D array of shape (ny*osamp,
+          nx*osamp) where each pixel provides the transmission value of the
+          coronagraph at that location. It should have the following signature:
+                transmission_map_fn(inst_webbpsfext, c_coron, osamp=2,
+                shape=None, **transmission_map_kwargs)
+          See winnie.convolution.get_jwst_coron_transmission_map for
+          documentation regarding these arguments.
+
+        - If even more customization is needed: set prefetch_psf_grid to False
+          here and use the set_custom_grid method for the convolver (accessed
+          via the convolver attribute for the SpaceRDI object) to directly
+          set the PSF grid and related objects.
+        """
+        convolver_args = dict(reference_index=reference_index, fov_pixels=fov_pixels, osamp=osamp, output_ext=output_ext,
+                              prefetch_psf_grid=prefetch_psf_grid, recalc_psf_grid=recalc_psf_grid, grid_fn=grid_fn, grid_kwargs=grid_kwargs,
+                              grid_inds_fn=grid_inds_fn, grid_inds_kwargs=grid_inds_kwargs, transmission_map_fn=transmission_map_fn,
+                              transmission_map_kwargs=transmission_map_kwargs)
         
         if self.convolver is None or convolver_args != self.convolver_args: # If the convolver is not already set up or the args have changed
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
@@ -598,16 +873,51 @@ class SpaceRDI:
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
-            self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, **self.convolver_args)
+            self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
         pass 
 
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',
                                 raw_model=None, raw_model_pxscale=None, raw_model_center=None):
+        """
+        Sets a circumstellar scene model to be used in various procedures
+        (e.g., RDI forward modeling or MCRDI.) 
+
+        ______________ 
+        Input options:
+
+        raw_model, raw_model_pxscale, and raw_model_center: a north-up image of
+            the unconvolved circumstellar scene, the pixel scale of the model
+            (assumed arcsec/pixel if unitless, else should be astropy units
+            castable to arcsec/pixel), and the center position for the raw
+            model in pixel coordinates ([x,y]; i.e., where the star would be
+            located in the image). The raw model will be convolved with the
+            prepared convolution setup.
+        
+        model_cube: a 3D array matching the shape of either the cropped or
+            uncropped science observations and containing PSF-convolved model
+            images at the appropriate roll angles to match the data.
+
+        model_files: a list of filenames to load into a 3D array as model_cube.
+
+        model_ext and model_dir: the filename extension and directory to use
+            for populating a list of model files. model_ext defaults to
+            'cssmodel' and model_dir defaults to the output directory of the
+            SpaceKLIP database object.
+
+        If none of these are provided, the method will attempt to load saved
+        model images from the output directory of the SpaceKLIP database object
+        assuming an extension of 'cssmodel'. 
+        
+        If multiple options are provided, the list above indicates descending
+        priority.
+        """
         if raw_model is not None:
             if self.convolver is None:
-                    raise ValueError("""To run set_circumstellar_model with a raw model as input,
-                                      you must first execute prepare_convolution.""")
+                    raise ValueError("""
+                        To run set_circumstellar_model with a raw model as
+                        input, you must first execute prepare_convolution.
+                                     """)
             model_cube = self.convolver.convolve_model(raw_model, pxscale_in=raw_model_pxscale, c_star_in=raw_model_center)
 
         if model_cube is None:
@@ -617,28 +927,34 @@ class SpaceRDI:
                 model_files = np.array([model_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, model_ext) for f in self._files_sci])
             model_cube = np.array([fits.getdata(f, ext=1).squeeze() for f in model_files])
         
-        if np.all(np.asarray(model_cube.shape[-2:]) == np.asarray(self.imcube_sci.shape[-2:])):
-            self._csscube = model_cube
-        else:
-            y1,y2,x1,x2 = self._crop_indices
-            self._csscube = model_cube[..., y1:y2, x1:x2]
-        self._csscube[np.isnan(self.imcube_sci)] = np.nan
+        y1,y2,x1,x2 = self._crop_indices
+        if np.all(np.asarray(model_cube.shape[-2:]) == np.asarray(self.imcube_sci.shape[-2:])): # Model provided in cropped shape
+            self._imcube_css = np.zeros_like(self._imcube_sci)
+            self._imcube_css[..., y1:y2, x1:x2] = model_cube
+
+        else: # Model provided in uncropped shape
+            self._imcube_css = model_cube
+
+        self._imcube_css[np.isnan(self._imcube_sci)] = np.nan
+        self.imcube_css = self._imcube_css[..., y1:y2, x1:x2]
         pass
-    
+
 
     def save_circumstellar_model(self, output_ext='cssmodel', model_dict={}):
         """
-        Saves the current circumstellar model images to FITS files so they can be loaded later. The files will be saved
-        to the output directory of the SpaceRDI database object, with the same filename as the science data files but with
-        the input data_ext replaced with the specified output_ext ('cssmodel' by default). Any entries in model_dict will be
-        appended to the image header. If the circumstellar model is not set, this method will raise a ValueError.
+        Saves the current circumstellar model images to FITS files so they can
+        be loaded later. The files will be saved to the output directory of the
+        SpaceRDI database object, with the same filename as the science data
+        files but with the input data_ext replaced with the specified
+        output_ext ('cssmodel' by default). Any entries in model_dict will be
+        appended to the image header. If a circumstellar model is not set, this
+        method will raise a ValueError.
         """
-        if self._csscube is None:
+        if self.imcube_css is None:
             raise ValueError(
                     """
-                    Prior to executing save_cssmodel,
-                    you must first set a circumstellar model using 
-                    set_circumstellar_model.
+                    Prior to executing save_circumstellar_model, you must first set a
+                    circumstellar model using set_circumstellar_model.
                     """)
         for i,f in enumerate(self._files_sci):
             fout = self.database.output_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, output_ext)
@@ -648,23 +964,29 @@ class SpaceRDI:
                 h1.update(NAXIS1=self.nx, NAXIS2=self.ny, CRPIX1=self.c_star[0]+1, CRPIX2=self.c_star[1]+1)
                 h1.update(model_dict)
                 hdul_out[1].header = h1
-                hdul_out[1].data = self._csscube[i]
+                hdul_out[1].data = self.imcube_css[i]
                 hdul_out.writeto(fout, overwrite=self.overwrite)
         pass
 
 
-    def derotate_and_combine_cssmodel(self, collapse_rolls=True, output_ext='cssmodel', save_products=False):
-        if self._csscube is None:
+    def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False):
+        """
+        Derotates the current circumstellar model and averages over all rolls;
+        provides output in a SpaceReduction object to match the output of
+        run_rdi. If a circumstellar model is not set, this method will raise a
+        ValueError.
+        """
+        if self.imcube_css is None:
             raise ValueError(
                     """
-                    Prior to executing derotate_and_combine_cssmodel,
-                    you must first set a circumstellar model using 
+                    Prior to executing derotate_and_combine_circumstellar_model, you must
+                    first set a circumstellar model using
                     set_circumstellar_model.
                     """)
         
         pad_before_derot = self.pad_before_derot
         
-        csscube = self._csscube
+        csscube = self.imcube_css
         
         if pad_before_derot:
             residuals, c_derot = pad_and_rotate_hypercube(csscube, -self._posangs_sci,
@@ -689,11 +1011,8 @@ class SpaceRDI:
         else:
             im_rolls = None
         
-        products = SpaceReduction(spacerdi=self,
-                                           im=im_col,
-                                           rolls=im_rolls,
-                                           c_star_out=c_derot,
-                                           output_ext=output_ext)
+        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
+                                  c_star_out=c_derot, output_ext=output_ext)
         
         if save_products:
             try:
@@ -701,11 +1020,13 @@ class SpaceRDI:
             
             except OSError:
                 raise OSError("""
-                      A FITS file for this output_ext + output_dir + concat already exists!
-                      To overwrite existing files, set the overwrite attribute for your WinnieRDI
-                      instance to True. Alternatively, either change the output_ext attribute
-                      for your WinnieRDI instance, or select a different output directory when 
-                      initializing your SpaceKLIP database object.
+                      A FITS file for this output_ext + output_dir + concat
+                      already exists! To overwrite existing files, set the
+                      overwrite attribute for your WinnieRDI instance to True.
+                      Alternatively, either change the output_ext attribute for
+                      your WinnieRDI instance, or select a different output
+                      directory when initializing your SpaceKLIP database
+                      object.
                       """)
         return products
 
@@ -715,8 +1036,7 @@ class SpaceConvolution:
                  ncores=-1, use_gpu=False, verbose=True,
                  show_plots=False, show_progress=True,
                  overwrite=True, fetch_opd_by_date=True,
-                 pad_data='auto',
-                 psfgrids_output_dir='psfgrids'):
+                 pad_data='auto', psfgrids_output_dir='psfgrids'):
         
         self.database = database
         self.source_spectrum = source_spectrum
@@ -743,7 +1063,9 @@ class SpaceConvolution:
 
     def load_concat(self, concat, reference_index=None, coron_offsets=None, fov_pixels=151,
                     osamp=2, output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
-                    psf_grid_kwargs={}, cropped_shape=None):
+                    cropped_shape=None, grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
+                    grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
+                    transmission_map_fn=get_jwst_coron_transmission_map, transmission_map_kwargs={}):
         if isinstance(concat, numbers.Number):
             concat_str = list(self.database.obs.keys())[concat]
         else:
@@ -825,22 +1147,29 @@ class SpaceConvolution:
 
         if self.pad_data is not None: self._apply_padding()
 
-        if self.channel == 'SHORT':
+        # Will eventually store these data in a more mutable format
+        if self.channel == 'SHORT' and self.image_mask == 'MASK335R':
             webbpsf_options = dict(
                 pupil_shift_x = -0.0045,
                 pupil_shift_y = -0.0022,
                 pupil_rotation = -0.38)
-        elif self.channel == 'LONG': 
+        elif self.channel == 'LONG' and self.image_mask == 'MASK335R':
             webbpsf_options = dict(
                 pupil_shift_x = -0.0125,
                 pupil_shift_y = -0.008,
                 pupil_rotation = -0.595)
+        elif self.channel is None and self.image_mask == 'FQPM1140':
+            webbpsf_options = dict(
+                pupil_shift_x = 0.00957944,
+                pupil_shift_y = 0.01387777,
+                pupil_rotation = -0.10441008,
+                defocus_waves = 0.01478258)
         else:
             webbpsf_options = {}
 
         if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.inst_webbpsf.opd_query_date.split('T')[0] != self.date.split('T')[0]):
             self.initialize_webbpsf_instance(file=reference_file, options=webbpsf_options)
-        else: # Then update the non-OPD elements; This is more or less borrowed from webbpsf.setup_sim_to_match_file()
+        else: # Otherwise, update the non-OPD elements; This is more or less borrowed from webbpsf.setup_sim_to_match_file()
             if self.inst_webbpsf is None:
                 self.inst_webbpsf = webbpsf.instrument(self.instrument)
 
@@ -860,31 +1189,7 @@ class SpaceConvolution:
 
         self.inst_webbpsf.opd_query_date = self.date
         
-        if self.inst_webbpsfext is None or self.inst_webbpsfext.opd_query_date.split('T')[0] != self.date.split('T')[0]:
-            self.initialize_webbpsf_ext_instance(options=webbpsf_options)
-        else:
-            self.inst_webbpsfext.filter = self.filt
-            if self.inst_webbpsfext.name == 'NIRCam':
-                if self.pupil_mask.startswith('MASK'):
-                    # webbpsf-ext only checks for "LYOT" in the pupil mask when determining if the setup is coronagraphic,
-                    # so we're simply swapping to the prelaunch equivalents
-                    if self.pupil_mask.endswith('RND'):
-                        self.inst_webbpsfext.pupil_mask = 'CIRCLYOT'
-                    elif self.pupil_mask.endswith('WB'):
-                        self.inst_webbpsfext.pupil_mask = 'WEDGELYOT'
-                    else:
-                        self.inst_webbpsfext.pupil_mask = self.pupil_mask
-                    self.inst_webbpsfext.image_mask = self.image_mask                                                   
-            elif self.inst_webbpsfext.name == 'MIRI':
-                if self.filt in ['F1065C', 'F1140C', 'F1550C']:
-                    self.inst_webbpsfext.image_mask = 'FQPM'+self.filt[1:5]
-                elif self.inst_webbpsfext.filter == 'F2300C':
-                    self.inst_webbpsfext.image_mask = 'LYOT2300'
-            self.inst_webbpsfext.aperturename = self.aperturename
-            self.inst_webbpsfext.oversample = self.osamp
-            self.inst_webbpsfext.options.update(webbpsf_options)
-
-        self.inst_webbpsfext.opd_query_date = self.date
+        self.initialize_webbpsf_ext_instance(options=webbpsf_options)
 
         self.psf_file = '{}JWST_{}_{}_{}_{}_{}_fov{}_os{}_{}.fits'.format(self.psfgrids_output_dir,
                                                                                 header0['INSTRUME'],
@@ -902,7 +1207,9 @@ class SpaceConvolution:
 
         self.cropped_shape = cropped_shape
         if prefetch_psf_grid:
-            self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid, **psf_grid_kwargs)
+            self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid, grid_inds_fn=grid_inds_fn, 
+                                grid_inds_kwargs=grid_inds_kwargs, transmission_map_fn=transmission_map_fn,
+                                transmission_map_kwargs=transmission_map_kwargs, grid_fn=grid_fn, **grid_kwargs)
         else:
             self._grid_fetched = False
         pass
@@ -933,15 +1240,21 @@ class SpaceConvolution:
 
     
     def initialize_webbpsf_ext_instance(self, options):
+        # Swap to prelaunch equivalent mask names for WebbPSF-ext
+        if self.pupil_mask.endswith('RND'):
+            pupil_mask_ext = 'CIRCLYOT'
+        elif self.pupil_mask.endswith('WB'):
+            pupil_mask_ext = 'WEDGELYOT'
+        else:
+            pupil_mask_ext = self.pupil_mask
+
+        # Currently we only use webbpsf_ext for transmission maps, which aren't OPD dependent.
         if self.instrument == 'NIRCAM':
-            inst = webbpsf_ext.NIRCam_ext(filter=self.filt, pupil_mask=self.pupil_mask, image_mask=self.image_mask,
+            inst = webbpsf_ext.NIRCam_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self.image_mask,
                                          fov_pix=self.fov_pixels, oversample=self.osamp)
         else:
-            inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=self.pupil_mask, image_mask=self.image_mask,
+            inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self.image_mask,
                                         fov_pix=self.fov_pixels, oversample=self.osamp)
-        # Currently we only use webbpsf_ext for transmission maps, which aren't OPD dependent.
-        # if self.fetch_opd_by_date:
-        #     inst.load_wss_opd_by_date(self.date)
         inst.aperturename = self.aperturename
         inst.oversample = self.osamp
         inst.options.update(options)
@@ -959,10 +1272,65 @@ class SpaceConvolution:
         pass
     
     
-    def fetch_psf_grid(self, recalc_psf_grid=False,
-                        grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
-                        transmission_map_fn=get_jwst_coron_transmission_map, transmission_map_kwargs={},
-                        grid_fn=generate_lyot_psf_grid, **grid_kwargs):
+    def fetch_psf_grid(self, recalc_psf_grid=False, grid_inds_fn=get_jwst_psf_grid_inds,
+                        grid_inds_kwargs={}, transmission_map_fn=get_jwst_coron_transmission_map,
+                        transmission_map_kwargs={}, grid_fn=generate_lyot_psf_grid,
+                        **grid_kwargs):
+        """
+        ___________
+        Parameters:
+
+        recalc_psf_grid : bool, optional
+            Whether to recalculate the PSF grid if it has already been
+            generated and saved. Default is False.
+        grid_inds_fn : callable, optional
+            The function to use for matching model pixels to PSF grid samples.
+            Default is winnie.convolution.get_jwst_psf_grid_inds.
+        grid_inds_kwargs : dict, optional
+            Additional keyword arguments to be passed to grid_inds_fn.
+        transmission_map_fn : callable, optional
+            The function to use for generating the coronagraph transmission
+            map. Default is winnie.convolution.get_jwst_coron_transmission_map.
+        transmission_map_kwargs : dict, optional
+            Additional keyword arguments to be passed to transmission_map_fn.
+        grid_fn : callable, optional
+            The function to use for generating the PSF grid. Default is
+            winnie.convolution.generate_lyot_psf_grid.
+        grid_kwargs : dict, optional
+            Additional keyword arguments to be passed to grid_fn.
+
+        Notes:
+
+        - grid_fn should return three objects: 1) a 3D array of PSF samples, 2)
+          the 2D array of shape (2,N) containing the polar coordinates of those
+          samples (relative to the coronagraph center; units of [arcsec,
+          degrees]), and 3) the 2D array of shape (2,N) containing the
+          cartesian coordinates of those samples (relative to the coronagraph
+          center; units of [arcsec, arcsec]). It should take a WebbPSF
+          instrument object as the first argument, and must have the following
+          signature: 
+                grid_fn(inst_webbpsf, source_spectrum=None, shift=None,
+                osamp=2, fov_pixels=151, show_progress=True, **grid_kwargs)
+          See winnie.convolution.generate_lyot_psf_grid for documentation
+          regarding these arguments.
+
+        - grid_inds_fn should return a 2D integer array of shape (ny*osamp,
+          nx*osamp) where each pixel provides the index of the PSF sample that
+          should be used for convolution of that pixel. It should have the
+          following signature:
+                grid_inds_fn(c_coron, psf_offsets_polar, osamp=2, shape=None,
+                pxscale=None, **grid_inds_kwargs)
+          See winnie.convolution.get_jwst_psf_grid_inds for documentation
+          regarding these arguments.
+
+        - transmission_map_fn should return a 2D array of shape (ny*osamp,
+          nx*osamp) where each pixel provides the transmission value of the
+          coronagraph at that location. It should have the following signature:
+                transmission_map_fn(inst_webbpsfext, c_coron, osamp=2,
+                shape=None, **transmission_map_kwargs)
+          See winnie.convolution.get_jwst_coron_transmission_map for
+          documentation regarding these arguments.
+        """
         if os.path.isfile(self.psf_file) and not recalc_psf_grid:
             with fits.open(self.psf_file) as hdul:
                 self.psfs = hdul[0].data
@@ -987,7 +1355,7 @@ class SpaceConvolution:
         if grid_inds_fn is not None:
             psf_inds_osamp = []
             for c_coron in self._c_coron_sci:
-                psf_inds = grid_inds_fn(c_coron, self.psf_offsets_polar, self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **grid_inds_kwargs)
+                psf_inds = grid_inds_fn(c_coron, self.psf_offsets_polar, osamp=self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **grid_inds_kwargs)
                 psf_inds_osamp.append(psf_inds)
             self._psf_inds_osamp = np.asarray(psf_inds_osamp)
         else:
@@ -996,11 +1364,11 @@ class SpaceConvolution:
         if transmission_map_fn is not None:
             coron_tmaps_osamp = []
             for c_coron in self._c_coron_sci:
-                coron_tmap = transmission_map_fn(self.inst_webbpsfext, c_coron, return_oversample=True, osamp=self.osamp, nd_squares=True, shape=(self._ny, self._nx), **transmission_map_kwargs)
+                coron_tmap = transmission_map_fn(self.inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **transmission_map_kwargs)
                 coron_tmaps_osamp.append(coron_tmap)
             self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
         else:
-            self._coron_tmaps_osamp = None
+            self._coron_tmaps_osamp = np.ones((len(self._c_coron_sci), self._ny*self.osamp, self._nx*self.osamp))
 
         self._grid_fetched = True
         self.set_crop(self.cropped_shape)
@@ -1019,7 +1387,7 @@ class SpaceConvolution:
                 self.coron_tmaps_osamp, _, self.crop_indices_osamp = crop_data(self._coron_tmaps_osamp,
                                                                 c_to_c_osamp(self._c_star, self.osamp),
                                                                 self.cropped_shape*self.osamp,
-                                                                return_indices=True)
+                                                                return_indices=True, copy=False)
                 y1o, y2o, x1o, x2o = self.crop_indices_osamp
                 self.psf_inds_osamp = self._psf_inds_osamp[..., y1o:y2o, x1o:x2o]
                 self.ny, self.nx = self.cropped_shape
@@ -1033,6 +1401,15 @@ class SpaceConvolution:
                 self.coron_tmaps_osamp = self._coron_tmaps_osamp
                 self.psf_inds_osamp = self._psf_inds_osamp
                 self.ny, self.nx = self._ny, self._nx
+        pass
+
+
+    def set_custom_grid(self, psfs, psf_inds_osamp, coron_tmaps_osamp):
+        self.psfs = psfs
+        self._psf_inds_osamp = psf_inds_osamp
+        self._coron_tmaps_osamp = coron_tmaps_osamp
+        self._grid_fetched = True
+        self.set_crop(self.cropped_shape)
         pass
 
 
@@ -1053,7 +1430,7 @@ class SpaceConvolution:
         model_cr_ny, model_cr_nx = np.ceil(np.array([self.ny, self.nx])/sfac*self.osamp).astype(int)
         model_cr_nh = np.ceil(np.hypot(model_cr_nx, model_cr_ny)).astype(int)
 
-        model_cr, c_star_in_cr = crop_data(model, c_star_in, [model_cr_nh, model_cr_nh])
+        model_cr, c_star_in_cr = crop_data(model, c_star_in, [model_cr_nh, model_cr_nh], copy=True)
 
         if sfac != 1:
             model_osamp = webbpsf_ext.image_manip.frebin(model_cr, scale=sfac, total=False)

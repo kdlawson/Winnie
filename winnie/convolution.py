@@ -10,15 +10,9 @@ from copy import deepcopy
 
 def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=False, ncores=-2):
     """
-    Creates a PSF-convolved image where each pixel of the input image has been convolved with the
-    nearest spatially-sampled PSF. 
-    
-    Note: This can be sped up a little by preparing a boolean array where each slice is the shape
-          of im_in and is True where the corresponding slice in psfs is the nearest match. However, 
-          if `psfs' is very finely sampled, this would result in a very large array (e.g., if psfs
-          samples at every pixel in im_in, this would produce an array of shape (ny*nx, ny, nx)). 
-          In testing, the time saved was marginal enough (~5%) that I've avoided this approach in
-          favor of the more memory conscious inputs here.
+    Creates a PSF-convolved image where each pixel of the input image has been
+    convolved with the nearest spatially-sampled PSF. 
+
     ___________
     Parameters:
     
@@ -26,22 +20,22 @@ def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=F
             2D image array to be convolved.
             
         psfs: ndarray
-            3D image array of spatially-sampled PSFs with which to convolve im_in. Generally, each
+            3D image array of spatially-sampled PSFs with which to convolve
+            im_in. Generally, each
     
         psf_inds: ndarray
-            2D array (same shape as im_in; dtype=int); each entry gives the index of the slice in psfs with 
-            which that pixel in im_in should be convolved.
-    
-    Optional:
-    
-        coron_tmap: ndarray
-            2D array of coronagraph transmission (same shape as im_in), by which im_in will be multiplied before
-            convolution.
+            2D array (same shape as im_in; dtype=int); each entry gives the
+            index of the slice in psfs with which that pixel in im_in should be
+            convolved.
+
+        coron_tmap: ndarray, optional
+            2D array of coronagraph transmission (same shape as im_in), by
+            which im_in will be multiplied before convolution.
         
-        use_gpu: bool
+        use_gpu: bool, optional
             If True, use faster GPU-based CuPy routines for convolution.
             
-        ncores: int
+        ncores: int, optional
             The number of CPU cores to use (when use_gpu=False) for convolution
             
     Returns:
@@ -80,7 +74,8 @@ def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=F
 
 def psf_convolve_gpu(im, psf_im):
     """
-    GPU-based PSF convolution using CuPy's version of scipy.signal's fast fourier transform.
+    GPU-based PSF convolution using CuPy's version of scipy.signal's fast
+    fourier transform.
     """
     imcon = cp.asnumpy(cp_signal.fftconvolve(cp.array(im), cp.array(psf_im), mode='same'))
     return imcon
@@ -97,66 +92,75 @@ def psf_convolve_cpu(im, psf_im):
 def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, normalize='exit_pupil', shift=None, osamp=2, fov_pixels=201, show_progress=True):
     
     """
-    Creates a grid of synthetic PSFs using a WebbPSF NIRCam or MIRI WebbPSF object. The spatial sampling used here is not appropriate for MIRI FQPM data. 
+    Creates a grid of synthetic PSFs using a WebbPSF NIRCam or MIRI WebbPSF
+    object. The spatial sampling used here is not appropriate for MIRI FQPM
+    data. 
     
     ___________
     Parameters:
+
+    inst: webbpsf.webbpsf_core.NIRCam or webbpsf.webbpsf_core.MIRI
+        NIRCam or MIRI instrument object (set up appropriately for your
+        data) to use for generating PSFs.
     
-        inst: webbpsf.webbpsf_core.NIRCam or webbpsf.webbpsf_core.MIRI
-            NIRCam or MIRI instrument object (set up appropriately for your data) to use for generating PSFs.
-    
-    Optional:
-    
-        source_spectrum: synphot spectrum
-            A synphot spectrum object to use when generating the PSFs.
-            
-        nr: int
-            The number of radial PSF samples to use in the grid. Actual grid will have nr+1 radial samples,
-            since a grid point is added at r,theta = (0,0).
-            
-        ntheta: int
-            The number of azimuthal PSF samples to use in the grid.
-            
-        log_rscale: bool
-            If True (default), radial samples are logarithmically spaced (log10) between rmin and rmax arcseconds
-            
-        rmin: float
-            The minimum radial separation in arcseconds from the coronagraph center to use for the PSF grid.
-
-        rmax: float
-            The maximum radial separation in arcseconds from the coronagraph center to use for the PSF grid.
-
-        normalize: str
-            The normalization to use for the PSFs. Options are 'exit_pupil' (default), 'first', and 'last' 
-            (see WebbPSF documentation for more info).
-
-        shift: ndarray
-            The detector sampled shift (in pixels) needed to place the PSF as the geometric center of the array.
-            If None, no shift will be applied and the resulting PSFs may effectively shift your models
-            during convolution.
-
-        osamp: int
-            The oversampling factor for which to generate the synthetic PSFs
-
-        fov_pixels: int
-            The number of pixels for each axis of the detector-sampled PSF models 
-            (returned images will be fov_pixels*osamp)
-
-        show_progress: bool
-            If True, display a TQDM progress bar to track progress during PSF generation.
+    source_spectrum: synphot spectrum, optional
+        A synphot spectrum object to use when generating the PSFs.
         
+    nr: int, optional
+        The number of radial PSF samples to use in the grid. Actual grid
+        will have nr+1 radial samples, since a grid point is added at
+        r,theta = (0,0).
+        
+    ntheta: int, optional
+        The number of azimuthal PSF samples to use in the grid.
+        
+    log_rscale: bool, optional
+        If True (default), radial samples are logarithmically spaced
+        (log10) between rmin and rmax arcseconds
+        
+    rmin: float, optional
+        The minimum radial separation in arcseconds from the coronagraph
+        center to use for the PSF grid.
 
+    rmax: float, optional
+        The maximum radial separation in arcseconds from the coronagraph
+        center to use for the PSF grid.
+
+    normalize: str, optional
+        The normalization to use for the PSFs. Options are 'exit_pupil'
+        (default), 'first', and 'last' (see WebbPSF documentation for more
+        info).
+
+    shift: ndarray, optional
+        The detector sampled shift (in pixels) needed to place the PSF as
+        the geometric center of the array. If None, no shift will be
+        applied and the resulting PSFs may effectively shift your models
+        during convolution.
+
+    osamp: int, optional
+        The oversampling factor for which to generate the synthetic PSFs
+
+    fov_pixels: int, optional
+        The number of pixels for each axis of the detector-sampled PSF
+        models (returned images will be fov_pixels*osamp)
+
+    show_progress: bool, optional
+        If True, display a TQDM progress bar to track progress during PSF
+        generation.
+        
     Returns:
         psfs: ndarray
             The stack of synthetic PSF images
             
         psf_offsets_polar: ndarray
-            An array of shape (2,Nsamples) providing the polar (r,theta) offset from the coronagraph
-            center for each PSF sample in "psfs" in units of [arcsec, deg].
+            An array of shape (2,Nsamples) providing the polar (r,theta) offset
+            from the coronagraph center for each PSF sample in "psfs" in units
+            of [arcsec, deg].
 
         psf_offsets: ndarray
-            An array of shape (2,Nsamples) providing the (x,y) offset from the coronagraph
-            center for each PSF sample in "psfs" in units of arcsec.
+            An array of shape (2,Nsamples) providing the (x,y) offset from the
+            coronagraph center for each PSF sample in "psfs" in units of
+            arcsec.
     """
     
     if show_progress:
@@ -212,8 +216,8 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
 
 def get_webbpsf_model_center_offset(psf_off, osamp):
     """
-    Returns the detector-sampled shift required to geometrically center 'psf_off',
-    a PSF model generated with image_mask=None and with oversampling 'osamp'
+    Returns the detector-sampled shift required to geometrically center psf_off,
+    a PSF model generated with image_mask=None and with oversampling osamp.
     """
     psf_gauss = Gaussian2DKernel(x_stddev=1*osamp, y_stddev=2*osamp).array
     psf_gauss *= psf_off.max() / psf_gauss.max()
@@ -223,17 +227,21 @@ def get_webbpsf_model_center_offset(psf_off, osamp):
     return shift
 
 
-def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp, inst=None, shape=None, pxscale=None, posang=0, c_star=None):
+def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp=1, inst=None, shape=None, pxscale=None, posang=0, c_star=None):
     """
-    Given a coronagraph center coordinate (c_coron), a list of PSF sample points relative to the coronagraph in polar coordinates
-    ([r in arcsec, theta in deg]), and the desired oversampling factor (osamp), returns an image where each pixel value indicates the
-    index of the nearest (in polar coordinates) spatial PSF sample from the PSF grid.
+    Given a coronagraph center coordinate (c_coron), a list of PSF sample
+    points relative to the coronagraph in polar coordinates ([r in arcsec,
+    theta in deg]), and the desired oversampling factor (osamp), returns an
+    image where each pixel value indicates the index of the nearest (in polar
+    coordinates) spatial PSF sample from the PSF grid.
 
-    Either inst or shape and pxscale must be provided. 'shape' and 'pxscale' should be the detector sampled dimensions (i.e., before oversampling)
-    If inst is provided, assumes the nominal subarray size and scale for the output map.
+    Either inst or shape and pxscale must be provided. 'shape' and 'pxscale'
+    should be the detector sampled dimensions (i.e., before oversampling) If
+    inst is provided, assumes the nominal subarray size and scale for the
+    output map.
 
-    If posang and c_star are provided, generates the same map but assuming the data have been derotated for angle 'posang' about position
-    'c_star'. 
+    If posang and c_star are provided, generates the same map but assuming the
+    data have been derotated for angle 'posang' about position 'c_star'. 
     """
     if shape is None:
         siaf_ap = inst.siaf[inst.aperturename]
@@ -277,13 +285,14 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp, inst=None, shape=N
     return psf_inds
 
 
-def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp=None, nd_squares=False, shape=None, posang=0, c_star=None):
+def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp=None, nd_squares=True, shape=None, posang=0, c_star=None):
     """
-    Generates a coronagraph transmission map relative to position c_coron (detector sampled [x,y] in pixels) using inst — a WebbPSF-ext instrument
+    Generates a coronagraph transmission map relative to position c_coron
+    (detector sampled [x,y] in pixels) using inst — a WebbPSF-ext instrument
     object. 
 
-    If posang and c_star are provided, generates the same map but assuming the data have been derotated for angle 'posang' about position
-    'c_star'. 
+    If posang and c_star are provided, generates the same map but assuming the
+    data have been derotated for angle 'posang' about position 'c_star'. 
     """
 
     if shape is None:
