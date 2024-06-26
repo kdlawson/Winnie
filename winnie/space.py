@@ -1167,7 +1167,13 @@ class SpaceConvolution:
         else:
             webbpsf_options = {}
 
+        if self.pupil_mask == 'MASKBAR':
+            self.pupil_mask = self.aperturename.split('_')[1]
+
         if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.inst_webbpsf.opd_query_date.split('T')[0] != self.date.split('T')[0]):
+            if self.pupil_mask.endswith('WB'):
+                reference_file = fits.open(reference_file)
+                reference_file[0].header['PUPIL'] = self.pupil_mask
             self.initialize_webbpsf_instance(file=reference_file, options=webbpsf_options)
         else: # Otherwise, update the non-OPD elements; This is more or less borrowed from webbpsf.setup_sim_to_match_file()
             if self.inst_webbpsf is None:
@@ -1500,7 +1506,7 @@ class SpaceReduction:
                     h1['CD2_2'] = w.wcs.cd[1, 1]
 
                     c_coron_i = xy_polar_ang_displacement(*(c_coron_i-spacerdi.c_star),
-                                                           -spacerdi._posangs_sci[i])+c_star_out
+                                                            spacerdi._posangs_sci[i])+c_star_out
                 c_coron_out.append(c_coron_i)
                 
                 h1['CCORON1'], h1['CCORON2'] = zip(c_coron_i+1,
@@ -1520,7 +1526,7 @@ class SpaceReduction:
                                                                       output_ext)
             
             self.image_headers = image_headers
-            self.c_coron = c_coron_out
+            self.c_coron = np.array(c_coron_out)
             
             h1_combined = self.image_headers[0].copy()
             h1_combined['CCORON1'], h1_combined['CCORON2'] = zip(np.mean(c_coron_out, axis=0)+1,
