@@ -279,8 +279,11 @@ def animate_quick_implot(im_cube, dur=3, titles=None, border_color='k', fig_ax_f
     anim = animation.FuncAnimation(fig, animate, frames=nframes, interval=dur*1000 / len(im_cube))
     if save_frames_fmt is not None:
         import glob
-        import imageio.v2 as imageio
         import os
+        try:
+            import imageio.v2 as imageio
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError("To save an animation using this function, you must first install the optional imageio dependency.")
         frames = list(anim.frame_seq)
         for frame in frames:
             animate(frame, save=True)

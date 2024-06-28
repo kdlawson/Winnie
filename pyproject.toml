@@ -1,0 +1,47 @@
+[project]
+name = "Winnie"
+description = "RDI PSF subtraction and forward modeling for high-contrast imaging data"
+authors = [{ name = "Kellen Lawson", email = "kellenlawson@gmail.com" },]
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Programming Language :: Python",
+    "Intended Audience :: Science/Research",
+    ]
+dependencies = [
+    "astropy",
+    "joblib",
+    "jwst",
+    "matplotlib",
+    "numpy",
+    "pyklip @ git+https://bitbucket.org/pyKLIP/pyklip.git@jwst",
+    "scipy",
+    "spaceKLIP @ git+https://github.com/kammerje/spaceKLIP.git@develop",
+    "tqdm",
+    "webbpsf @ git+https://github.com/spacetelescope/webbpsf.git@develop",
+    "webbpsf_ext @ git+https://github.com/JarronL/webbpsf_ext.git@develop",
+    ]
+
+
+[project.optional-dependencies]
+tutorials = ["lmfit", "vip_hci", "synphot",]
+gpu = ["cupy",]   
+
+
+[project.urls]
+github_project = "https://github.com/kdlawson/Winnie"
+
+
+[build-system]
+requires = [
+    "setuptools >= 61.2",
+    "setuptools_scm[toml]>=3.4.3",
+    "wheel",
+    ]
+build-backend = "setuptools.build_meta"
+
+
+[tool.setuptools_scm]
+write_to = "winnie/_version.py"

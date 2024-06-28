@@ -7,6 +7,8 @@ import astropy.units as u
 from scipy import signal
 from joblib import Parallel, delayed
 from copy import deepcopy
+from tqdm.auto import tqdm
+
 
 def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=False, ncores=-2):
     """
@@ -90,11 +92,11 @@ def psf_convolve_cpu(im, psf_im):
 
 
 def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, normalize='exit_pupil', shift=None, osamp=2, fov_pixels=201, show_progress=True):
-    
     """
     Creates a grid of synthetic PSFs using a WebbPSF NIRCam or MIRI WebbPSF
-    object. The spatial sampling used here is not appropriate for MIRI FQPM
-    data. 
+    object. The spatial sampling used here is not appropriate for non-Lyot 
+    data. Portions of this code are adapted from examples in the WebbPSF-ext
+    documentation.
     
     ___________
     Parameters:
@@ -162,17 +164,6 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
             coronagraph center for each PSF sample in "psfs" in units of
             arcsec.
     """
-    
-    if show_progress:
-        try:
-            from tqdm.auto import tqdm
-        except ModuleNotFoundError:
-            print('tqdm module not found!\n'
-                  'To show progress bar ("show_progress = True")\n'
-                  'install tqdm (e.g. "pip install tqdm").\n'
-                  'Proceeding without progress bar . . .')
-            show_progress = False
-                    
     # Set up the grid:
     if log_rscale:
         rvals = 10**(np.linspace(np.log10(rmin), np.log10(rmax), nr))

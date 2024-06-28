@@ -26,7 +26,7 @@ from .convolution import (convolve_with_spatial_psfs,
                           get_webbpsf_model_center_offset)
 
 class SpaceRDI:
-    def __init__(self, database, data_ext, ncores=-1, use_gpu=False, 
+    def __init__(self, database, data_ext=None, ncores=-1, use_gpu=False, 
                  verbose=True, show_plots=False, overwrite=False,
                  prop_err=True, show_progress=False, use_robust_mean=False,
                  robust_clip_nsig=3, pad_data='auto', pad_before_derot=False,
@@ -40,14 +40,18 @@ class SpaceRDI:
             SpaceKLIP database containing stage 2 observations to work with.
 
         data_ext: str
-            The file extension used for the input FITS files (e.g., 'calints').
+            The file extension for the input FITS files (e.g., 'calints'). If
+            not provided, the file extension will be assumed to be the text
+            following the final underscore in the name of the first file of the
+            first concatenation (excluding the '.fits' extension).
 
         ncores: int
-            Number of processor cores to use where applicable
+            Number of processor cores to use where applicable.
 
         use_gpu: bool
-            Use GPU operations on a CUDA-capable GPU in place of some CPU operations.
-            Note: this is currently not used. Still working on updating the GPU code.
+            Use GPU operations on a CUDA-capable GPU in place of some CPU
+            operations. Note: this is currently not used. Still working on
+            updating the GPU code.
 
         verbose: bool
             Provides some reduction info in print statements in a few places.
@@ -56,53 +60,61 @@ class SpaceRDI:
             Shows some diagnostic plots when verbose is True.
 
         overwrite: bool
-            When saving reduction products, overwrite existing products if True.
+            When saving reduction products, overwrite existing products if
+            True.
 
         prop_err: bool
-            If True, will load ERR array extension and propagate error through any RDI reduc
-            of the data.
+            If True, will load ERR array extension and propagate error through
+            any RDI reduc of the data.
 
         show_progress: bool
-            If True, will show progress bars for the RDI procedure. Note: usually unnecessary
-            (and uninformative) for JWST data, where the small number of frames makes PSF 
-            subtraction very fast.
+            If True, will show progress bars for the RDI procedure. Note:
+            usually unnecessary (and uninformative) for JWST data, where the
+            small number of frames makes PSF subtraction very fast.
 
         use_robust_mean: bool
-            If data are not already coadded, will combine integrations using a sigma clipped
-            mean rather than the median.
+            If data are not already coadded, will combine integrations using a
+            sigma clipped mean rather than the median.
 
         robust_clip_nsig: int or float
-            If use_robust_mean=True, the number of median absolute deviations above or below
-            the median for a value to be clipped.
+            If use_robust_mean=True, the number of median absolute deviations
+            above or below the median for a value to be clipped.
 
         pad_data: int or str
-            If pad_data is an int, pads the data (both science and reference) with pad_data pixels
-            along each end of every spatial axis. E.g., input data of shape (320,320) with pad_data=5
-            will yield data of shape (330,330). If pad_data is 'auto', automatically pads the data 
-            such that no data is lost when derotating by the position angles of the science data. 
-            Setting pad_data = None will prevent padding.
+            If pad_data is an int, pads the data (both science and reference)
+            with pad_data pixels along each end of the spatial axes. E.g.,
+            input data of shape (320,320) with pad_data=5 will yield data of
+            shape (330,330). If pad_data is 'auto', automatically pads the data
+            such that no data is lost when derotating by the position angles of
+            the science data. Setting pad_data = None will prevent padding.
 
         pad_before_derot: bool
-            If True, pads data at the derotation step to avoid cutting off pixels during rotation.
-            Redundant if used with pad_data='auto'. Technically slightly more resource efficient 
-            than pad_data='auto', but makes some details of forward modeling a lot trickier.
+            If True, pads data at the derotation step to avoid cutting off
+            pixels during rotation. Redundant if used with pad_data='auto'.
+            Technically slightly more resource efficient than pad_data='auto',
+            but makes some details of forward modeling a lot trickier.
 
         r_opt: array, float, None
-            The optimization zone radii to pass as 'r_opt' to winnie.rdi.build_annular_rdi_zones
-            when loading each concatenation. See winnie.rdi.build_annular_rdi_zones doctstring for
-            more info on permitted formats. Defaults to 3*u.arcsec (producing a single optimization 
-            zone spanning 0-3 arcsec from the star).
+            The optimization zone radii to pass as 'r_opt' to
+            winnie.rdi.build_annular_rdi_zones when loading each concatenation.
+            See winnie.rdi.build_annular_rdi_zones doctstring for more info on
+            permitted formats. Defaults to 3*u.arcsec (producing a single
+            optimization zone spanning 0-3 arcsec from the star).
 
         r_sub: array, float, None
-            The subtraction zone radii to pass as 'r_sub' to winnie.rdi.build_annular_rdi_zones
-            when loading each concatenation. See winnie.rdi.build_annular_rdi_zones doctstring for
-            more info on permitted formats. Defaults to None (producing a single subtraction zone
-            spanning the field of view).
+            The subtraction zone radii to pass as 'r_sub' to
+            winnie.rdi.build_annular_rdi_zones when loading each concatenation.
+            See winnie.rdi.build_annular_rdi_zones doctstring for more info on
+            permitted formats. Defaults to None (producing a single subtraction
+            zone spanning the field of view).
         """
         self.concat = None
         self.convolver = None
         self.database = database
-        self.data_ext = data_ext
+        if data_ext is None:
+            self.data_ext = self.database.obs[list(self.database.obs.keys())[0]]['FITSFILE'][0].split('_')[-1].removesuffix('.fits')
+        else:
+            self.data_ext = data_ext
         self.ncores = ncores
         self.use_gpu = use_gpu
         self.verbose = verbose
@@ -289,7 +301,7 @@ class SpaceRDI:
 
         For cropped_shape = 'auto':
         - calculates the largest separation of pixels included in the optimization zones,
-          and adds auto_pad_nfwhm times the effective FWHM
+          and adds auto_pad_nfwhm times the effective FWHM in pixels
         - sets the cropped shape such that those separations are included in the FOV.
         """
         if cropped_shape == 'auto':
@@ -393,8 +405,7 @@ class SpaceRDI:
                              """)
         output_ext = copy(self.output_ext)
         if forward_model:
-            if (('coeffs_in' in self.rdi_settings and self.rdi_settings['coeffs_in'] is not None) 
-                or ('coeffs_in' in extra_rdi_settings and extra_rdi_settings['coeffs_in'] is not None)):
+            if (self.rdi_settings.get('coeffs_in', None) is not None) or (extra_rdi_settings.get('coeffs_in', None) is not None):
                 raise ValueError("""
                     Forward modeling with run_rdi is not valid when using fixed
                     RDI coefficients. For classical RDI, the output from the
@@ -457,8 +468,8 @@ class SpaceRDI:
             uni_visit_ids, uni_visit_inds = np.unique(self._visit_ids_sci, return_index=True)
             uni_visit_ids = uni_visit_ids[np.argsort(uni_visit_inds)]
             for visit_id in uni_visit_ids:
-                visit_filt = self._visit_ids_sci == visit_id
-                im_roll, err_roll = median_combine(residuals[visit_filt], (residuals_err[visit_filt] if prop_err else None))
+                visit = self._visit_ids_sci == visit_id
+                im_roll, err_roll = median_combine(residuals[visit], (residuals_err[visit] if prop_err else None))
                 im_rolls.append(im_roll)
                 err_rolls.append(err_roll)
             im_rolls = np.asarray(im_rolls)
@@ -481,9 +492,9 @@ class SpaceRDI:
                 raise OSError("""
                       A FITS file for this output_ext + output_dir + concat
                       already exists! To overwrite existing files, set the
-                      overwrite attribute for your WinnieSpaceRDI instance to
+                      overwrite attribute for your Winnie SpaceRDI instance to
                       True. Alternatively, either change the output_ext
-                      attribute for your WinnieRDI instance, or select a
+                      attribute for your SpaceRDI instance, or select a
                       different output directory when initializing your
                       SpaceKLIP database object.
                       """)
@@ -958,6 +969,18 @@ class SpaceRDI:
                     """)
         for i,f in enumerate(self._files_sci):
             fout = self.database.output_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, output_ext)
+            if fout == f:
+                raise ValueError(f"""
+                    The output file path for the circumstellar model is the
+                    same as the input data file: 
+                        {fout}
+                    This is either because the specified data_ext is not
+                    contained in the data filename, or because the value for
+                    data_ext is the same as the specified output_ext. Choose a
+                    different output_ext or change the data_ext attribute for
+                    your SpaceRDI instance to avoid overwriting the input data
+                    files.
+                    """)
             with fits.open(f) as hdul:
                 hdul_out = fits.HDUList([hdul[0], hdul[1]])
                 h1 = hdul_out[1].header
@@ -1022,11 +1045,11 @@ class SpaceRDI:
                 raise OSError("""
                       A FITS file for this output_ext + output_dir + concat
                       already exists! To overwrite existing files, set the
-                      overwrite attribute for your WinnieRDI instance to True.
-                      Alternatively, either change the output_ext attribute for
-                      your WinnieRDI instance, or select a different output
-                      directory when initializing your SpaceKLIP database
-                      object.
+                      overwrite attribute for your Winnie SpaceRDI instance to
+                      True. Alternatively, either change the output_ext
+                      attribute for your SpaceRDI instance, or select a
+                      different output directory when initializing your
+                      SpaceKLIP database object.
                       """)
         return products
 
@@ -1116,6 +1139,7 @@ class SpaceConvolution:
 
         self.image_mask = header0['CORONMSK'].replace('MASKA', 'MASK').replace('4QPM_', 'FQPM')
         self.aperturename = header0['APERNAME']
+        self.pps_aper = header0['PPS_APER']
         self.filt = header0['FILTER']
         self.channel = header0.get('CHANNEL', None)
         self.instrument = header0['INSTRUME']
@@ -1168,7 +1192,7 @@ class SpaceConvolution:
             webbpsf_options = {}
 
         if self.pupil_mask == 'MASKBAR':
-            self.pupil_mask = self.aperturename.split('_')[1]
+            self.pupil_mask = self.pps_aper.split('_')[1]
 
         if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.inst_webbpsf.opd_query_date.split('T')[0] != self.date.split('T')[0]):
             if self.pupil_mask.endswith('WB'):
@@ -1467,9 +1491,9 @@ class SpaceReduction:
         
         Options for loading saved output:
         a) provide file_to_load, a complete or relative path to a FITS file saved by Winnie
-        b) provide spacerdi, output_ext, and concat — where spacerdi can be a WinnieRDI object WITHOUT
+        b) provide spacerdi, output_ext, and concat — where spacerdi can be a SpaceRDI object WITHOUT
            a concatenation loaded to save memory.
-        c) provide spacerdi and output_ext, where spacerdi is a WinnieRDI instance WITH a concatenation loaded
+        c) provide spacerdi and output_ext, where spacerdi is a SpaceRDI instance WITH a concatenation loaded
            and where output_ext is the extension that was used when saving the file previously.
         """
         if spacerdi is not None and np.logical_or(im is not None, rolls is not None):

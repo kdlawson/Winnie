@@ -463,6 +463,7 @@ def pad_and_rotate_hypercube(hcube, angles, cent=None, ncores=-1, use_gpu=False,
     hcube_pad_rot = rotate_hypercube(hcube_pad, angles, cent=cent_pad, ncores=ncores, use_gpu=use_gpu, cval0=cval0, prefilter=prefilter)
     return hcube_pad_rot, cent_pad
 
+
 def compute_derot_padding(nx, ny, angles, cent=None):
     if cent is None:
         cent = (np.array([nx, ny])-1.)/2.
@@ -477,6 +478,7 @@ def compute_derot_padding(nx, ny, angles, cent=None):
     dxmin_pad, dymin_pad = (np.ceil(np.abs(np.min(derot_corner_coords, axis=0) - np.array([dxmin, dymin])))).astype(int)
     dxmax_pad, dymax_pad = (np.ceil(np.abs(np.max(derot_corner_coords, axis=0) - np.array([dxmax, dymax])))).astype(int)
     return dymin_pad, dymax_pad, dxmin_pad, dxmax_pad
+
 
 def free_gpu(*args):
     N = len(args)

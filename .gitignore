@@ -2,3 +2,6 @@
 __pycache__/
 tutorials/aumic_rdi_example/WinnieRDI/
 .ipynb_checkpoints/
+winnie/_version.py
+Winnie.egg-info/
+build/
