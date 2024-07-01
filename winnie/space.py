@@ -131,7 +131,6 @@ class SpaceRDI:
         if self.use_gpu:
             print("Warning! GPU implementation still in progress; setting use_gpu to False.")
             self.use_gpu = False
-        pass
        
         
     def load_concat(self, concat, coron_offsets=None, cropped_shape=None):
@@ -267,7 +266,6 @@ class SpaceRDI:
 
         if self.convolver is not None:
             self.convolver.load_concat(self.concat, **self.convolver_args)
-        pass
 
 
     def _apply_padding(self):
@@ -289,7 +287,6 @@ class SpaceRDI:
         self._c_coron_ref += cent_adj
 
         self._ny, self._nx = self._imcube_sci.shape[1:]
-        pass
 
 
     def set_crop(self, cropped_shape=None, auto_pad_nfwhm=5):
@@ -342,7 +339,6 @@ class SpaceRDI:
     
         if self.convolver is not None:
             self.convolver.set_crop(cropped_shape)
-        pass
 
 
     def run_rdi(self, save_products=False, return_res_only=False,
@@ -571,7 +567,6 @@ class SpaceRDI:
                 self.optzones = np.where(np.logical_or(nans_sci, nans_ref), False, self.optzones)
             else:
                 self.optzones = self._optzones
-        pass
 
 
     def update_annular_zones(self, exclude_opt_nans=True):
@@ -588,7 +583,6 @@ class SpaceRDI:
         """
         optzones, subzones = build_annular_rdi_zones(self._nx, self._ny, self._c_star, r_opt=self.r_opt, r_sub=self.r_sub, pxscale=self.pxscale)
         self.set_zones(optzones, subzones, exclude_opt_nans=exclude_opt_nans)
-        pass
 
 
     def report_current_config(self, show_plots=None):
@@ -628,7 +622,6 @@ class SpaceRDI:
                 for axis in [ax.xaxis, ax.yaxis]:
                     axis.set_major_formatter("${x:0.0f}''$")
             plt.show()
-        pass
     
     
     def set_fixed_rdi_settings(self, **settings):
@@ -682,7 +675,6 @@ class SpaceRDI:
         """
         self.fixed_rdi_settings = settings
         self.rdi_settings.update(self.fixed_rdi_settings)
-        pass
     
     
     def set_presets(self, presets={}, output_ext='psfsub'):
@@ -697,7 +689,6 @@ class SpaceRDI:
         self.rdi_settings.update(self.fixed_rdi_settings)
         if self.verbose:
             self.report_current_config()
-        pass
     
     
     def rdi_presets(self, output_ext='rdi_psfsub'):
@@ -710,7 +701,6 @@ class SpaceRDI:
                 products. Defaults to 'rdi_psfsub'.
         """
         self.set_presets(presets={}, output_ext=output_ext)
-        pass
     
     
     def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub'):
@@ -747,7 +737,6 @@ class SpaceRDI:
         if nans:
             presets['zero_nans'] = True
         self.set_presets(presets=presets, output_ext=output_ext)
-        pass
     
     
     def mcrdi_presets(self, output_ext='mcrdi_psfsub'):
@@ -775,7 +764,6 @@ class SpaceRDI:
 
         self.set_presets(presets={'hcube_css': self.imcube_css[:, np.newaxis]},
                          output_ext=output_ext)
-        pass
     
 
     def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
@@ -885,7 +873,6 @@ class SpaceRDI:
 
         if self.concat != self.convolver.concat:
             self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
-        pass 
 
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',
@@ -948,7 +935,6 @@ class SpaceRDI:
 
         self._imcube_css[np.isnan(self._imcube_sci)] = np.nan
         self.imcube_css = self._imcube_css[..., y1:y2, x1:x2]
-        pass
 
 
     def save_circumstellar_model(self, output_ext='cssmodel', model_dict={}):
@@ -989,7 +975,6 @@ class SpaceRDI:
                 hdul_out[1].header = h1
                 hdul_out[1].data = self.imcube_css[i]
                 hdul_out.writeto(fout, overwrite=self.overwrite)
-        pass
 
 
     def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False):
@@ -1081,7 +1066,6 @@ class SpaceConvolution:
         if self.use_gpu:
             print("Warning! GPU implementation still in progress; setting use_gpu to False.")
             self.use_gpu = False
-        pass
 
 
     def load_concat(self, concat, reference_index=None, coron_offsets=None, fov_pixels=151,
@@ -1242,7 +1226,6 @@ class SpaceConvolution:
                                 transmission_map_kwargs=transmission_map_kwargs, grid_fn=grid_fn, **grid_kwargs)
         else:
             self._grid_fetched = False
-        pass
         
 
     def _apply_padding(self):
@@ -1259,14 +1242,12 @@ class SpaceConvolution:
 
         self._ny = self._ny + dymin_pad + dymax_pad
         self._nx = self._nx + dxmin_pad + dxmax_pad
-        pass
 
 
     def initialize_webbpsf_instance(self, file, options):
         inst = webbpsf.setup_sim_to_match_file(file)
         inst.options.update(options)
         self.inst_webbpsf = inst
-        pass
 
     
     def initialize_webbpsf_ext_instance(self, options):
@@ -1289,7 +1270,6 @@ class SpaceConvolution:
         inst.oversample = self.osamp
         inst.options.update(options)
         self.inst_webbpsfext = inst
-        pass
     
 
     def calc_psf_shift(self):
@@ -1299,7 +1279,6 @@ class SpaceConvolution:
                                     oversample=4,
                                     fov_pixels=35)[2].data
         self._psf_shift = get_webbpsf_model_center_offset(psf_off, osamp=4)
-        pass
     
     
     def fetch_psf_grid(self, recalc_psf_grid=False, grid_inds_fn=get_jwst_psf_grid_inds,
@@ -1402,7 +1381,6 @@ class SpaceConvolution:
 
         self._grid_fetched = True
         self.set_crop(self.cropped_shape)
-        pass
 
 
     def set_crop(self, cropped_shape=None):
@@ -1431,7 +1409,6 @@ class SpaceConvolution:
                 self.coron_tmaps_osamp = self._coron_tmaps_osamp
                 self.psf_inds_osamp = self._psf_inds_osamp
                 self.ny, self.nx = self._ny, self._nx
-        pass
 
 
     def set_custom_grid(self, psfs, psf_inds_osamp, coron_tmaps_osamp):
@@ -1440,7 +1417,6 @@ class SpaceConvolution:
         self._coron_tmaps_osamp = coron_tmaps_osamp
         self._grid_fetched = True
         self.set_crop(self.cropped_shape)
-        pass
 
 
     def convolve_model(self, model, pxscale_in, c_star_in=None):
@@ -1633,13 +1609,11 @@ class SpaceReduction:
                 self.ny, self.nx = self.rolls.shape[1:]
 
         self.extent = mpl_centered_extent([self.ny, self.nx], self.c_star, self.pxscale)
-        pass
     
 
     def generate_rmaps(self):
         self.rmap = dist_to_pt(self.c_star, self.nx, self.ny)
         self.rmap_arcsec = px_size_to_ang_size(self.rmap, self.pxscale).value
-        pass
 
 
     def to_hdulist(self):
@@ -1673,4 +1647,3 @@ class SpaceReduction:
                   The file you are attempting to write already exists! Use overwrite=True to overwrite
                   the existing file, or assign a different file name by changing the filename attribute.
                   """)
-        pass
