@@ -20,7 +20,9 @@ dependencies = [
     "scipy",
     "spaceKLIP",
     "tqdm",
-    "photutils"
+    "photutils",
+    "webbpsf",
+    "webbpsf_ext",
     ]
 
 
