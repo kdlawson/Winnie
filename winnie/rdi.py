@@ -205,13 +205,13 @@ def compute_rdi_coefficients(hcube, hcube_ref, optzones, show_progress=False, re
         for Li in L:  # Second loop over wavelengths
             optmat = optmats[Li]  # The (nT_ref, nT) matrix for this wavelength
             refmat = refmats[Li]  # The (nT_ref, nT_ref) matrix for this wavelength
-            lu, piv = linalg.lu_factor(refmat)  # Since we aren't excluding frames as in ADI/SDI, we just need to run this once per wavelength.
+            lu, piv = linalg.lu_factor(refmat, check_finite=False)  # Since we aren't excluding frames as in ADI/SDI, we just need to run this once per wavelength.
             for Ti in T:  # Final loop over integrations / exposures
                 tararr = optmat[:,Ti]  # 1d vector of length equal to nT_ref
                 if ref_mask is not None:
-                    coeff_hcube[Ri, Ti, ref_mask[Ri], Li] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
+                    coeff_hcube[Ri, Ti, ref_mask[Ri], Li] = linalg.lu_solve((lu, piv), tararr, check_finite=False) # Gets coefficients and places them into the appropriate positions in the coefficient array
                 else:
-                    coeff_hcube[Ri, Ti, :, Li] = linalg.lu_solve((lu, piv), tararr) # Gets coefficients and places them into the appropriate positions in the coefficient array
+                    coeff_hcube[Ri, Ti, :, Li] = linalg.lu_solve((lu, piv), tararr, check_finite=False) # Gets coefficients and places them into the appropriate positions in the coefficient array
     return coeff_hcube
 
 

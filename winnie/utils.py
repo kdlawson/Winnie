@@ -2,7 +2,7 @@ import numpy as np
 import astropy.units as u
 from scipy import ndimage
 from joblib import Parallel, delayed
-
+from photutils.aperture import EllipticalAnnulus, aperture_photometry
 
 def dist_to_pt(pt, nx=201, ny=201, dtype=np.float32):
     """
@@ -22,8 +22,8 @@ def propagate_nans_in_spatial_operation(a, fn, fn_args=None,
                                         prop_zeros=True):
     """
     This takes an array, a, and and a function that performs some spatial operation on a, fn,
-    and endeavours to propgate any nans (and optionally: zeros, which are often also non-physical values)
-    through the indicated operation. Note: this operation is intentionally liberal with propgating the specified values.
+    and endeavours to propagate any nans (and optionally: zeros, which are often also non-physical values)
+    through the indicated operation. Note: this operation is intentionally liberal with propagating the specified values.
     I.e., for rotation of an image with nans, expect there to be more NaN pixels following the operation. 
     This can be tuned somewhat by increasing the value of prop_threshold (0 <= prop_threshold <= 1)
     
@@ -478,6 +478,98 @@ def compute_derot_padding(nx, ny, angles, cent=None):
     dxmin_pad, dymin_pad = (np.ceil(np.abs(np.min(derot_corner_coords, axis=0) - np.array([dxmin, dymin])))).astype(int)
     dxmax_pad, dymax_pad = (np.ceil(np.abs(np.max(derot_corner_coords, axis=0) - np.array([dxmax, dymax])))).astype(int)
     return dymin_pad, dymax_pad, dxmin_pad, dxmax_pad
+
+
+def deprojected_radial_profile(im, pa, incl, cent, pxscale, rmin, rmax, dr=0.1, rw=0.1):
+    """
+    Computes the mean deprojected radial profile.
+    
+    Parameters
+    ----------
+    im: ndarray
+        Image for which to measure the profile. NaNs in the array will result
+        in NaNs in the output profile.
+
+    pa: float
+        Position angle for the deprojection in degrees.
+        
+    incl: float
+        Inclination for the deprojection in degrees.
+        
+    cent: ndarray
+        Two element array providing the center point for the profile as [x,y].
+        
+    pxscale: float or astropy.units.quantity.Quantity
+        The pixel scale for the data. If a unitless float, value is assumed to be
+        arcsec/pixel. If having astropy units, the units must be equivalent to 
+        arcsec/pixel (e.g., mas/pixel, deg/pixel).
+        
+    rmin: float
+        Minimum radius for measurements in arcsec.
+        
+    rmax: float
+        Maximum radius for measurements in arcsec.
+        
+    dr: float
+        Radial spacing for measurements in arcsec.
+    
+    rw: float
+        Radial width of annuli in arcsec.
+
+    Returns
+    -------
+    rads: ndarray
+        Average radius of each measurement in arcsec.
+        
+    rprof: ndarray
+        Deprojected radial profile having the same units as the input image.
+    """
+    irads = np.arange(rmin, rmax+dr, dr) # inner radii in arcsec
+    orads = irads + rw # outer radii in arcsec
+    rads = 0.5*(irads+orads) # average radii for each annulus
+    cosi = np.cos(np.deg2rad(incl)) # cosine of the inclination
+    
+    rprof = np.zeros(irads.shape[0], dtype=np.float32)
+    for i,(irad,orad) in enumerate(zip(irads,orads)):
+        if irad == 0: irad += 1e-12 # irad = 0 otherwise raises an error
+        aper = EllipticalAnnulus(cent, a_in=ang_size_to_px_size(irad, pxscale).value, a_out=ang_size_to_px_size(orad, pxscale).value,
+                                 b_in=cosi*ang_size_to_px_size(irad, pxscale).value, b_out=cosi*ang_size_to_px_size(orad, pxscale).value,
+                                 theta=(pa+90)*u.deg)
+        rprof[i] = np.array(aperture_photometry(im, aper)['aperture_sum'])/aper.area
+    return rads, rprof
+
+
+def radial_calc_1d(im, cent, fn, fn_kwargs={}, dr=0.5, rmin=None, rmax=None, feature_mask=None, return_rmap=False, dtype=np.float32):
+    """
+    Computed a radial profile for 'im'
+    """
+    ny, nx = im.shape
+    rmap = dist_to_pt(cent, nx, ny, dtype=np.float32)
+    if rmin is None: rmin = np.min(rmap)
+    if rmax is None: rmax = np.max(rmap)
+    rarr = np.arange(rmin, rmax+dr, dr, dtype=np.float32)
+    rprof_1d = np.zeros_like(rarr)+np.nan
+    im_prepped = im.copy()
+    if feature_mask is not None:
+        im_prepped[feature_mask] = np.nan
+    nans_msk = np.isnan(im_prepped)
+    for i, rv in enumerate(rarr):
+        ropt = (rmap <= rv + dr) & (rmap >= rv - dr)
+        if np.any(ropt):
+            fopt = im_prepped[ropt & ~nans_msk]
+            rprof_1d[i] = fn(fopt, **fn_kwargs)
+    out = [rarr, rprof_1d]
+    if return_rmap:
+        out.append(rmap)
+    return out
+
+
+def radial_calc_2d(im, cent, fn, fn_kwargs={}, dr=0.5, rmin=None, rmax=None, feature_mask=None, dtype=np.float32):
+    from scipy.interpolate import interp1d
+    out_1d = radial_calc_1d(im, cent, fn, fn_kwargs, dr, rmin, rmax, feature_mask, return_rmap=True, dtype=dtype)
+    rarr, rprof_1d, rmap = out_1d[0], out_1d[1], out_1d[-1]
+    rprof_2d = interp1d(rarr, rprof_1d, fill_value=np.nan, bounds_error=False)(rmap)
+    return rprof_2d
 
 
 def free_gpu(*args):
