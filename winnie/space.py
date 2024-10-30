@@ -49,6 +49,14 @@ class SpaceRDI:
          database: spaceKLIP.database.Database
             SpaceKLIP database containing stage 2 observations to work with.
 
+        output_basedir: str
+            Base directory for saving reduction products. If not provided, the
+            output directory will be the same as that of the input database.
+        
+        output_subdir: str
+            Subdirectory within output_basedir to save reduction products. If
+            not provided, the subdirectory will be 'WinnieRDI'.
+
         data_ext: str
             The file extension for the input FITS files (e.g., 'calints'). If
             not provided, the file extension will be assumed to be the text
@@ -126,21 +134,27 @@ class SpaceRDI:
 
         save_instance: bool
             If True, writes the current instance of the SpaceRDI object as an
-            HDU when saving reduction products to disk. This instance can be 
+            HDU when saving reduction products to disk. This instance can be
             reconstructed by passing the fits filename as the from_fits
             argument when initializing a SpaceRDI object.
 
         efficient_saving: bool
             If True and if save_instance, stores the SpaceRDI object with only
             the data that should not already be stored on disk (e.g., not the
-            data arrays themselves). This significantly reduces output
-            file sizes, but does not guarantee that the object can be precisely
+            data arrays themselves). This significantly reduces output file
+            sizes, but does not guarantee that the object can be precisely
             reconstructed later (e.g., if the data files are changed, deleted,
             or moved). With efficient_saving=False, expect file sizes to be
             large (~hundreds of MB without a PSF grid loaded, ~1-2 GB if a PSF
             grid is loaded). The benefit of efficient_saving=False is that the
             reconstruction is relatively robust and includes all of the data
             needed in a single file.
+
+        from_fits: str
+            Path to a Winnie reduction FITS file created with
+            save_instance=True from which the SpaceRDI object will be
+            recreated. If from_fits is provided, all other arguments are
+            ignored.
         """
         if from_fits is not None:
             self._from_fits(from_fits)
