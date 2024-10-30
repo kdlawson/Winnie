@@ -1,4 +1,4 @@
-axes.formatter.min_exponent: 4
+axes.formatter.min_exponent: 3
 
 axes.linewidth: 1.5
 ytick.major.width:   1.5

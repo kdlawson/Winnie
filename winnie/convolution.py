@@ -193,9 +193,14 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
         psfs.append(psf)
     psfs = np.array(psfs)
     
+    extra_shift = np.array([psfs.shape[1]%2-1, psfs.shape[2]%2-1])[::-1]/2.
+
     if shift is not None:
-        psfs = np.array([imageregistration.fourier_imshift(psf, shift*osamp) for psf in psfs])
+        psfs = np.array([imageregistration.fourier_imshift(psf, shift*osamp+extra_shift) for psf in psfs])
         
+    if np.any(extra_shift != 0): # Crop any even axes to odd
+        psfs = psfs[:, :int(extra_shift[1]*2), :int(extra_shift[0]*2)]
+
     # Science positions in detector pixels
     field_rot = 0 if inst._rotation is None else inst._rotation
     
@@ -272,7 +277,7 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp=1, inst=None, shape
         nearest_thvals = thvals_wrap0[np.argmin(np.array([np.abs(tmap_osamp-thval) for thval in thvals_wrap]), axis=0)]
         for thval in thvals:
             i = np.where((thvals_all == thval)&(rvals_all == rval))[0][0]
-            psf_inds[(nearest_rvals == rval) & (nearest_thvals == thval)] = i
+            psf_inds[(nearest_rvals == rval)&(nearest_thvals == thval)] = i
     return psf_inds
 
 

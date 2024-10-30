@@ -6,6 +6,15 @@ RDI PSF subtraction and forward modeling should work for any JWST coronagraphy. 
 
 Open an issue if you have any problems or want to suggest new features.
 
+## Notice: Version 1.1 Update
+
+The version 1.1 release makes a few big changes to the package that may affect
+backwards compatability. The conventions for output filenames has changed to be
+more consistent with JWST products from other packages. Loading older Winnie products back into a
+"SpaceReduction" object should still work fine. However, **to load pre 1.1 PSF
+grids into 1.1+, you will need to either alter the filename of your stored grid
+or explicitly set which file to load.**
+
 ## Installation
 
 #### Clone this repository:

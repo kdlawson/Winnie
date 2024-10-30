@@ -1,7 +1,10 @@
 .DS_Store
 __pycache__/
 tutorials/aumic_rdi_example/WinnieRDI/
+tutorials/aumic_rdi_example/css_subtracted/
+tutorials/aumic_rdi_example/rawcon/
 .ipynb_checkpoints/
 winnie/_version.py
 Winnie.egg-info/
 build/
+winnie/resources/

@@ -1,6 +1,6 @@
 import numpy as np
 from astropy.io import fits
-from astropy import wcs
+from astropy import wcs, convolution
 from pyklip.klip import _rotate_wcs_hdr
 import numbers
 from copy import (copy, deepcopy)
@@ -8,6 +8,9 @@ import astropy.units as u
 import os
 import webbpsf
 import webbpsf_ext
+import pickle
+from spaceKLIP.database import Database as spaceklip_database
+from tqdm.auto import tqdm
 
 from .rdi import (rdi_residuals, build_annular_rdi_zones)
 
@@ -17,7 +20,8 @@ from .utils import (robust_mean_combine, median_combine,
                     ang_size_to_px_size, px_size_to_ang_size,
                     high_pass_filter_sequence, pad_and_rotate_hypercube, rotate_hypercube,
                     xy_polar_ang_displacement, rotate_image, gaussian_filter_sequence, crop_data,
-                    c_to_c_osamp, pad_or_crop_image, dist_to_pt, compute_derot_padding)
+                    c_to_c_osamp, pad_or_crop_image, dist_to_pt, compute_derot_padding, 
+                    nan_median_absolute_deviation)
 
 from .convolution import (convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
@@ -25,18 +29,24 @@ from .convolution import (convolve_with_spatial_psfs,
                           generate_lyot_psf_grid,
                           get_webbpsf_model_center_offset)
 
+from .deconvolution import (coronagraphic_richardson_lucy)
+
+
 class SpaceRDI:
-    def __init__(self, database, data_ext=None, ncores=-1, use_gpu=False, 
-                 verbose=True, show_plots=False, overwrite=False,
-                 prop_err=True, show_progress=False, use_robust_mean=False,
-                 robust_clip_nsig=3, pad_data='auto', pad_before_derot=False,
-                 r_opt=3*u.arcsec, r_sub=None):
+    def __init__(self, database=None, output_basedir=None,
+                 output_subdir='WinnieRDI', data_ext=None,
+                 ncores=-1, use_gpu=False, verbose=True, show_plots=False,
+                 overwrite=False, prop_err=True, show_progress=False,
+                 use_robust_mean=False, robust_clip_nsig=3, pad_data='auto', 
+                 pad_before_derot=False, r_opt=3*u.arcsec, r_sub=None, 
+                 save_coron_transmission=True, save_instance=False, 
+                 efficient_saving=True, from_fits=None):
         """
         Initialize the Winnie class for carrying out RDI on JWST data.
 
         Parameters
         ----------
-         database: spaceklip.Database
+         database: spaceKLIP.database.Database
             SpaceKLIP database containing stage 2 observations to work with.
 
         data_ext: str
@@ -107,30 +117,68 @@ class SpaceRDI:
             See winnie.rdi.build_annular_rdi_zones doctstring for more info on
             permitted formats. Defaults to None (producing a single subtraction
             zone spanning the field of view).
+
+        save_coron_transmission: bool
+            If True, when executing run_rdi with save_products=True and
+            forward_model=False, saves the derotated and averaged PSF mask for
+            each reduction for compatability with SpaceKLIP (as long as masks
+            have been set).
+
+        save_instance: bool
+            If True, writes the current instance of the SpaceRDI object as an
+            HDU when saving reduction products to disk. This instance can be 
+            reconstructed by passing the fits filename as the from_fits
+            argument when initializing a SpaceRDI object.
+
+        efficient_saving: bool
+            If True and if save_instance, stores the SpaceRDI object with only
+            the data that should not already be stored on disk (e.g., not the
+            data arrays themselves). This significantly reduces output
+            file sizes, but does not guarantee that the object can be precisely
+            reconstructed later (e.g., if the data files are changed, deleted,
+            or moved). With efficient_saving=False, expect file sizes to be
+            large (~hundreds of MB without a PSF grid loaded, ~1-2 GB if a PSF
+            grid is loaded). The benefit of efficient_saving=False is that the
+            reconstruction is relatively robust and includes all of the data
+            needed in a single file.
         """
-        self.concat = None
-        self.convolver = None
-        self.database = database
-        if data_ext is None:
-            self.data_ext = self.database.obs[list(self.database.obs.keys())[0]]['FITSFILE'][0].split('_')[-1].removesuffix('.fits')
+        if from_fits is not None:
+            self._from_fits(from_fits)
         else:
-            self.data_ext = data_ext
-        self.ncores = ncores
-        self.use_gpu = use_gpu
-        self.verbose = verbose
-        self.show_plots = show_plots
-        self.overwrite = overwrite
-        self.show_progress = show_progress
-        self.prop_err = prop_err
-        self.use_robust_mean = use_robust_mean
-        self.robust_clip_nsig = robust_clip_nsig
-        self.pad_data = pad_data
-        self.pad_before_derot = pad_before_derot
-        self.r_opt = r_opt
-        self.r_sub = r_sub
-        if self.use_gpu:
-            print("Warning! GPU implementation still in progress; setting use_gpu to False.")
-            self.use_gpu = False
+            self.concat = None
+            self.convolver = None
+            self.database = database
+            output_basedir = self.database.output_dir if output_basedir is None else output_basedir
+            if not os.path.isdir(output_basedir):
+                os.makedirs(output_basedir)
+            self.output_dir = f'{output_basedir}{output_subdir}/'
+            self.output_subdir = output_subdir
+            self.output_basedir = output_basedir
+            if not os.path.isdir(self.output_dir):
+                os.makedirs(self.output_dir)
+            if data_ext is None:
+                self.data_ext = self.database.obs[list(self.database.obs.keys())[0]]['FITSFILE'][0].split('_')[-1].removesuffix('.fits')
+            else:
+                self.data_ext = data_ext
+            self.ncores = ncores
+            self.use_gpu = use_gpu
+            self.verbose = verbose
+            self.show_plots = show_plots
+            self.overwrite = overwrite
+            self.show_progress = show_progress
+            self.prop_err = prop_err
+            self.use_robust_mean = use_robust_mean
+            self.robust_clip_nsig = robust_clip_nsig
+            self.pad_data = pad_data
+            self.pad_before_derot = pad_before_derot
+            self.r_opt = r_opt
+            self.r_sub = r_sub
+            self.save_coron_transmission = save_coron_transmission
+            self.save_instance = save_instance
+            self.efficient_saving = efficient_saving
+            if self.use_gpu:
+                print("Warning! GPU implementation still in progress; setting use_gpu to False.")
+                self.use_gpu = False
        
         
     def load_concat(self, concat, coron_offsets=None, cropped_shape=None):
@@ -228,33 +276,31 @@ class SpaceRDI:
             self._pupil_mask = h0['PUPIL']
         self._aperturename = h0['APERNAME']
         self.filt = h0['FILTER']
-        
-        imcube, errcube, posangs, visit_ids, c_coron, dates, files = (np.asarray(i) for i in [imcube, errcube, posangs, visit_ids, c_coron, dates, files])
 
-        self._imcube_sci = imcube[sci]
-        self._errcube_sci = errcube[sci] if self.prop_err else None
-        self._posangs_sci = posangs[sci]
-        self._visit_ids_sci = visit_ids[sci]
-        self._c_coron_sci = c_coron[sci]
-        self._dates_sci = dates[sci]
-        self._files_sci = files[sci]
+        self._imcube_sci = np.array(imcube)[sci]
+        self._errcube_sci = np.array(errcube)[sci] if self.prop_err else None
+        self._posangs_sci = np.array(posangs)[sci]
+        self._visit_ids_sci = np.array(visit_ids)[sci]
+        self._c_coron_sci = np.array(c_coron)[sci]
+        self._dates_sci = np.array(dates)[sci]
+        self._files_sci = np.array(files)[sci]
 
-        self._imcube_ref = imcube[ref]
-        self._errcube_ref = errcube[ref] if self.prop_err else None
-        self._posangs_ref = posangs[ref]
-        self._visit_ids_ref = visit_ids[ref]
-        self._c_coron_ref = c_coron[ref]
-        self._dates_ref = dates[ref]
-        self._files_ref = files[ref]
+        self._imcube_ref = np.array(imcube)[ref]
+        self._errcube_ref = np.array(errcube)[ref] if self.prop_err else None
+        self._posangs_ref = np.array(posangs)[ref]
+        self._visit_ids_ref = np.array(visit_ids)[ref]
+        self._c_coron_ref = np.array(c_coron)[ref]
+        self._dates_ref = np.array(dates)[ref]
+        self._files_ref = np.array(files)[ref]
         
-        self._ny, self._nx = imcube.shape[-2:]
+        self._ny, self._nx = self._imcube_sci.shape[-2:]
         
         if self.pad_data is not None: self._apply_padding()
 
         self._imcube_css = None
-        self.imcube_css = None
-        self.cropped_shape = None
+        self.cropped_shape = cropped_shape
         
+        self.rdi_settings = {}
         self.fixed_rdi_settings = {}
 
         # Setting initial annular zones for RDI procedure based on set defaults.
@@ -267,6 +313,11 @@ class SpaceRDI:
         if self.convolver is not None:
             self.convolver.load_concat(self.concat, **self.convolver_args)
 
+        if self.save_coron_transmission:
+            outfile = self.output_dir + self.concat + '_psfmask.fits'
+            if not os.path.exists(outfile) or np.shape(fits.getdata(outfile)) != [self.ny, self.nx]:
+                _ = self.make_derot_coron_maps(collapse_rolls=False, save_products=True)
+
 
     def _apply_padding(self):
         if self.pad_data == 'auto':
@@ -276,7 +327,8 @@ class SpaceRDI:
 
         imc_padding = [[0,0], [dymin_pad, dymax_pad], [dxmin_pad, dxmax_pad]]
         cent_adj = np.array([dxmin_pad, dymin_pad])
-        
+
+        self._imc_padding = imc_padding
         self._imcube_sci = np.pad(self._imcube_sci, imc_padding, constant_values=np.nan)
         self._errcube_sci = np.pad(self._errcube_sci, imc_padding, constant_values=np.nan) if self.prop_err else None
         self._imcube_ref = np.pad(self._imcube_ref, imc_padding, constant_values=np.nan)
@@ -320,6 +372,8 @@ class SpaceRDI:
             self.ny, self.nx = self.cropped_shape
             if self._imcube_css is not None:
                 self.imcube_css = self._imcube_css[..., y1:y2, x1:x2]
+            else:
+                self.imcube_css = self._imcube_css
 
         else: # Set cropped data to non-cropped
             self.imcube_sci = self._imcube_sci
@@ -334,8 +388,7 @@ class SpaceRDI:
             self.ny, self.nx = self._ny, self._nx
             self._crop_indices = [0, self._ny+1, 0, self._nx+1]
             self.cropped_shape = cropped_shape
-            if self._imcube_css is not None:
-                self.imcube_css = self._imcube_css
+            self.imcube_css = self._imcube_css
     
         if self.convolver is not None:
             self.convolver.set_crop(cropped_shape)
@@ -400,6 +453,7 @@ class SpaceRDI:
                 using the load_concat method.
                              """)
         output_ext = copy(self.output_ext)
+        reduc_label = copy(self.reduc_label)
         if forward_model:
             if (self.rdi_settings.get('coeffs_in', None) is not None) or (extra_rdi_settings.get('coeffs_in', None) is not None):
                 raise ValueError("""
@@ -417,13 +471,14 @@ class SpaceRDI:
             imcube_sci = self.imcube_css
             prop_err = False # Never propagate error when forward modeling
             output_ext = output_ext + '_fwdmod'
+            reduc_label = f'FM {reduc_label}'
         else:
             imcube_sci = self.imcube_sci
             prop_err = self.prop_err
             
         pad_before_derot = self.pad_before_derot
         
-        if not prop_err or return_res_only:
+        if not prop_err:# or return_res_only:
             err_hcube = err_hcube_ref = None
         else:
             err_hcube = self.errcube_sci[:, np.newaxis] 
@@ -472,7 +527,7 @@ class SpaceRDI:
             err_rolls = np.asarray(err_rolls) if prop_err else None
         else:
             im_rolls = err_rolls = None
-        
+
         products = SpaceReduction(spacerdi=self,
                                   im=im_col,
                                   rolls=im_rolls,
@@ -480,10 +535,15 @@ class SpaceRDI:
                                   err_rolls=err_rolls,
                                   c_star_out=c_derot, 
                                   output_ext=output_ext,
-                                  derotated=derotate)
+                                  derotated=derotate,
+                                  reduc_label=self.reduc_label)
         if save_products:
+            if self.save_instance and not forward_model:
+                extra_hdus = [self._to_fits()]
+            else:
+                extra_hdus = []
             try:
-                products.save(overwrite=self.overwrite)
+                products.save(overwrite=self.overwrite, extra_hdus=extra_hdus)
             except OSError:
                 raise OSError("""
                       A FITS file for this output_ext + output_dir + concat
@@ -494,6 +554,10 @@ class SpaceRDI:
                       different output directory when initializing your
                       SpaceKLIP database object.
                       """)
+            if not forward_model:
+                if self.concat in self.database.red and products.filename in self.database.red[self.concat]['FITSFILE']:
+                    self.database.red[self.concat].remove_row(np.where(self.database.red[self.concat]['FITSFILE'] == products.filename)[0][0])
+                self.database.read_jwst_s3_data(products.filename)
         return products
 
     
@@ -583,6 +647,7 @@ class SpaceRDI:
         """
         optzones, subzones = build_annular_rdi_zones(self._nx, self._ny, self._c_star, r_opt=self.r_opt, r_sub=self.r_sub, pxscale=self.pxscale)
         self.set_zones(optzones, subzones, exclude_opt_nans=exclude_opt_nans)
+        self._check_smoothed_nans()
 
 
     def report_current_config(self, show_plots=None):
@@ -597,6 +662,7 @@ class SpaceRDI:
         print(f'Science data:   {self.imcube_sci.shape[0]} exposures of shape ({self.ny},{self.nx})')
         print(f'Reference data: {self.imcube_ref.shape[0]} exposures of shape ({self.ny},{self.nx})\n')
         print(f'RDI Settings:')
+        print(f'Mode: {self.reduc_label}')
         for key in self.rdi_settings:
             if isinstance(self.rdi_settings[key], np.ndarray):
                 desc = f'{type(self.rdi_settings[key])} of shape {self.rdi_settings[key].shape}'
@@ -677,7 +743,7 @@ class SpaceRDI:
         self.rdi_settings.update(self.fixed_rdi_settings)
     
     
-    def set_presets(self, presets={}, output_ext='psfsub'):
+    def set_presets(self, presets={}, output_ext='psfsub', reduc_label='Custom RDI (Winnie)'):
         """
         Generic method to quickly assign a set of arguments to use for
         winnie.rdi.rdi_residuals, while also setting the extension for saved
@@ -687,23 +753,24 @@ class SpaceRDI:
         self.output_ext = output_ext
         self.rdi_settings = presets
         self.rdi_settings.update(self.fixed_rdi_settings)
+        self.reduc_label = reduc_label
+        self._check_smoothed_nans()
         if self.verbose:
             self.report_current_config()
     
     
-    def rdi_presets(self, output_ext='rdi_psfsub'):
+    def rdi_presets(self, output_ext='rdi_psfsub', reduc_label='RDI (Winnie)'):
         """
         Set presets to perform a standard RDI reduction.
-
         ___________
         Parameters:
             output_ext (str, optional): Output file extension for FITS
                 products. Defaults to 'rdi_psfsub'.
         """
-        self.set_presets(presets={}, output_ext=output_ext)
+        self.set_presets(presets={}, output_ext=output_ext, reduc_label=reduc_label)
     
     
-    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub'):
+    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub', reduc_label='HPFRDI (Winnie)'):
         """
         Set presets for High-Pass Filtering RDI (HPFRDI), in which coefficients
         are computed by comparing high-pass filtered science and reference
@@ -716,30 +783,16 @@ class SpaceRDI:
             filter_size_adj (float, optional): Adjustment factor for the filter
                 size. Defaults to 1. output_ext (str, optional): Output file
                 extension for FITS products. Defaults to 'hpfrdi_psfsub'.
-
-        Notes:
-            - This method checks if there will be any NaN values in the
-              optimization zones after applying the specified filtering.
-            - If so, it also sets 'zero_nans' to True to avoid a crash when
-              run_rdi is called.
         """
         if filter_size is None:
             filter_size = self._sigma
         presets = {}
         presets['opt_smoothing_fn'] = high_pass_filter_sequence
         presets['opt_smoothing_kwargs'] = dict(filtersize=filter_size_adj*filter_size)
-        # See if there's any NaNs in our optzones after filtering is applied. 
-        # If so, add zero_nans=True to our settings to avoid a crash.
-        sci_filt = high_pass_filter_sequence(self.imcube_sci, filter_size)
-        ref_filt = high_pass_filter_sequence(self.imcube_ref, filter_size)
-        allopt = np.any(self.optzones, axis=0)
-        nans = np.any([*np.isnan(sci_filt[..., allopt]), *np.isnan(ref_filt[..., allopt])])
-        if nans:
-            presets['zero_nans'] = True
-        self.set_presets(presets=presets, output_ext=output_ext)
+        self.set_presets(presets=presets, output_ext=output_ext, reduc_label=reduc_label)
     
     
-    def mcrdi_presets(self, output_ext='mcrdi_psfsub'):
+    def mcrdi_presets(self, output_ext='mcrdi_psfsub', reduc_label='MCRDI (Winnie)'):
         """
         Set presets for Model Constrained RDI (MCRDI), in which coefficients
         are computed by comparing reference data to science data from which an
@@ -763,12 +816,12 @@ class SpaceRDI:
                 """)
 
         self.set_presets(presets={'hcube_css': self.imcube_css[:, np.newaxis]},
-                         output_ext=output_ext)
+                         output_ext=output_ext, reduc_label=reduc_label)
     
 
     def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
                             output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
-                            psfgrids_output_dir='psfgrids', fetch_opd_by_date=True, 
+                            convolver_basedir=None, convolver_subdir='psfgrids', fetch_opd_by_date=True, 
                             grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                             grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
                             transmission_map_fn=get_jwst_coron_transmission_map,
@@ -866,9 +919,12 @@ class SpaceRDI:
                               transmission_map_kwargs=transmission_map_kwargs)
         
         if self.convolver is None or convolver_args != self.convolver_args: # If the convolver is not already set up or the args have changed
+            if convolver_basedir is None:
+                convolver_basedir = self.output_dir
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
-                                              psfgrids_output_dir=psfgrids_output_dir, fetch_opd_by_date=fetch_opd_by_date, pad_data=self.pad_data)
+                                              output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
+                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving)
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
@@ -911,7 +967,7 @@ class SpaceRDI:
         priority.
         """
         if raw_model is not None:
-            if self.convolver is None:
+            if self.convolver is None or self.convolver.psfs is None:
                     raise ValueError("""
                         To run set_circumstellar_model with a raw model as
                         input, you must first execute prepare_convolution.
@@ -921,7 +977,7 @@ class SpaceRDI:
         if model_cube is None:
             if model_files is None:
                 if model_dir is None:
-                    model_dir = self.database.output_dir
+                    model_dir = self.output_dir
                 model_files = np.array([model_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, model_ext) for f in self._files_sci])
             model_cube = np.array([fits.getdata(f, ext=1).squeeze() for f in model_files])
         
@@ -954,7 +1010,7 @@ class SpaceRDI:
                     circumstellar model using set_circumstellar_model.
                     """)
         for i,f in enumerate(self._files_sci):
-            fout = self.database.output_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, output_ext)
+            fout = self.output_dir+os.path.basename(os.path.normpath(f)).replace(self.data_ext, output_ext)
             if fout == f:
                 raise ValueError(f"""
                     The output file path for the circumstellar model is the
@@ -1036,7 +1092,496 @@ class SpaceRDI:
                       different output directory when initializing your
                       SpaceKLIP database object.
                       """)
+
         return products
+
+
+    def make_derot_coron_maps(self, collapse_rolls=False, save_products=False):
+        coron_tmaps = np.zeros_like(self.imcube_sci)
+        maskfiles = self.database.obs[self.concat]['MASKFILE'][self.database.obs[self.concat]['TYPE']=='SCI']
+        inst = None
+        for i, c_coron in enumerate(self.c_coron_sci):
+            if maskfiles[i] == 'NONE' or fits.getval(maskfiles[i], 'NAXIS', ext=1) == 0:
+                if self.convolver is not None and self.convolver.coron_tmaps_osamp is not None: # Use the already-loaded transmission map
+                    coron_tmaps[i] = webbpsf_ext.image_manip.frebin(self.convolver.coron_tmaps_osamp[i], scale=1./self.convolver.osamp, total=False)
+                else: # generate a transmission map image
+                    if inst is None: # On first iteration, initialize our WebbPSF-ext object
+                        # Swap to prelaunch equivalent mask names for WebbPSF-ext
+                        if self._pupil_mask.endswith('RND'):
+                            pupil_mask_ext = 'CIRCLYOT'
+                        elif self._pupil_mask.endswith('WB'):
+                            pupil_mask_ext = 'WEDGELYOT'
+                        else:
+                            pupil_mask_ext = self._pupil_mask
+                        if self.database.obs[self.concat]['INSTRUME'][0] == 'NIRCAM':
+                            inst = webbpsf_ext.NIRCam_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self._image_mask, oversample=3)
+                        else:
+                            inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self._image_mask, oversample=3)
+                        inst.aperturename = self._aperturename
+                    coron_tmaps[i] = get_jwst_coron_transmission_map(inst, c_coron, osamp=3, shape=(self.ny, self.nx), return_oversample=False, nd_squares=True)
+            else: # Load the provided transmission map
+                coron_tmap = fits.getdata(maskfiles[i])
+                if self.pad_data is not None:
+                    coron_tmap = np.pad(coron_tmap, self._imc_padding[1:], constant_values=np.nan)
+                coron_tmaps[i] = coron_tmap
+        if self.pad_before_derot:
+            coron_tmaps_derot, c_derot = pad_and_rotate_hypercube(coron_tmaps, -self._posangs_sci,
+                                                          cent=self.c_star, ncores=self.ncores, 
+                                                          use_gpu=self.use_gpu, cval0=np.nan)
+        else:
+            coron_tmaps_derot, c_derot = rotate_hypercube(coron_tmaps, -self._posangs_sci,
+                                                  cent=self.c_star, ncores=self.ncores, 
+                                                  use_gpu=self.use_gpu, cval0=np.nan), self.c_star
+                    
+        im_col, _ = median_combine(coron_tmaps_derot)
+        
+        if collapse_rolls:
+            im_rolls = []
+            uni_visit_ids, uni_visit_inds = np.unique(self._visit_ids_sci, return_index=True)
+            uni_visit_ids = uni_visit_ids[np.argsort(uni_visit_inds)]
+            for visit_id in uni_visit_ids:
+                visit_filt = self._visit_ids_sci == visit_id
+                im_roll, _ = median_combine(coron_tmaps_derot[visit_filt])
+                im_rolls.append(im_roll)
+            im_rolls = np.asarray(im_rolls)
+        else:
+            im_rolls = None
+
+        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
+                                  c_star_out=c_derot, output_ext='psfmask')
+
+        products.filename = products.filename.replace('psfmask_i2d.fits', 'psfmask.fits')
+
+        if save_products:
+            products.save(overwrite=True)
+        return products
+
+    
+    def make_css_subtracted_residuals(self, data_reduc=None, model_reduc=None, save_products=True):
+        if data_reduc is None:
+            data_reduc = self.run_rdi(save_products=False)
+            reduc_label = f'CSS-sub {self.reduc_label}'
+        else:
+            reduc_label = f'CSS-sub {data_reduc.reduc_label}'
+        if model_reduc is None:
+            model_reduc = self.run_rdi(save_products=False, forward_model=True)
+        output_ext = data_reduc.output_ext+'_csssub'
+        products = SpaceReduction(spacerdi=self, im=data_reduc.im-model_reduc.im, rolls=data_reduc.rolls-model_reduc.rolls, c_star_out=data_reduc.c_star, output_ext=output_ext, reduc_label=reduc_label)
+        if save_products:
+            try:
+                products.save(overwrite=self.overwrite)
+            except OSError:
+                raise OSError("""
+                      A FITS file for this output_ext + output_dir + concat
+                      already exists! To overwrite existing files, set the
+                      overwrite attribute for your Winnie SpaceRDI instance to
+                      True. Alternatively, either change the output_ext
+                      attribute for your SpaceRDI instance, or select a
+                      different output directory when initializing your
+                      SpaceKLIP database object.
+                      """)
+            if self.concat in self.database.red and products.filename in self.database.red[self.concat]['FITSFILE']:
+                self.database.red[self.concat].remove_row(np.where(self.database.red[self.concat]['FITSFILE'] == products.filename)[0][0])
+            self.database.read_jwst_s3_data(products.filename)
+        return products
+
+
+    def make_css_subtracted_stage2_products(self, subdir='css_subtracted', update_database=False):
+        """
+        Creates a new subdirectory ('css_subtracted' by default) and saves the
+        science data with the current circumstellar model subtracted, along with
+        reference data and maskfiles. Optionally updates the entries in the
+        SpaceKLIP database. The outputs of this method can then be used as inputs
+        for a SpaceKLIP reduction, if preferred — e.g., to extract candidate
+        photometry. 
+        
+        WARNING: candidate photometry extracted with SpaceKLIP will only be valid
+        if the candidate source was excluded from the optimization zones used for
+        Winnie PSF subtraction, as well as from the region used for optimizing the
+        disk model. Otherwise, the source will affect the resulting disk model and
+        the source photometry will be biased.
+        """
+        if self.imcube_css is None:
+            raise ValueError(
+                    """
+                    Prior to executing make_css_subtracted_stage2_products, you
+                    must first set a circumstellar model using
+                    set_circumstellar_model.
+                    """)
+        output_dir = self.output_basedir+subdir+'/'
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+        for i,f in enumerate(self._files_sci):
+            j = np.where(self.database.obs[self.concat]['FITSFILE']==f)[0][0]
+            im_css = self.imcube_css[i][self._imc_padding[1][0]:-self._imc_padding[1][1], self._imc_padding[2][0]:-self._imc_padding[2][1]]
+            fcss_sub = output_dir+os.path.basename(os.path.normpath(f))
+            with fits.open(f) as hdul:
+                hdul['SCI'].data -= im_css
+                hdul.writeto(fcss_sub, overwrite=True)
+            fmask = self.database.obs[self.concat]['MASKFILE'][j]
+            if fmask is not None:
+                fmask_out = output_dir+os.path.basename(os.path.normpath(fmask))
+                with fits.open(fmask) as hdul:
+                    hdul.writeto(fmask_out, overwrite=True)
+            else:
+                fmask_out = None
+            if update_database:
+                self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
+        for i,f in enumerate(self._files_ref):
+            j = np.where(self.database.obs[self.concat]['FITSFILE']==f)[0][0]
+            fcss_sub = output_dir+os.path.basename(os.path.normpath(f))
+            with fits.open(f) as hdul:
+                hdul.writeto(fcss_sub, overwrite=True)
+                
+            fmask = self.database.obs[self.concat]['MASKFILE'][j]
+            if fmask is not None:
+                fmask_out = output_dir+os.path.basename(os.path.normpath(fmask))
+                with fits.open(fmask) as hdul:
+                    hdul.writeto(fmask_out, overwrite=True)
+            else:
+                fmask_out = None
+            if update_database:
+                self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
+        
+
+    def jackknife_references(self, derotate=False, exclude_by_visitid=True, show_progress=True):
+        """
+        If exclude_by_visitid is True, carries out reductions using jackknife
+        resampling over each unique visit ID, leaving out all reference images
+        with a given visit ID in turn. For a reference target with multiple
+        rolls, this will exclude only one roll at a time. For a reference
+        target with multiple dithers, this will exclude all of the dithers at
+        once. For nVis visit IDs, this results in nVis reductions.
+
+        If exclude_by_visitid is False, for nRef reference images, carries out
+        jackknife resampling by running nRef reductions leaving out each
+        reference image in turn.
+
+        The former is more useful for identifying the images contributing
+        off-axis sources to the PSF model, while the latter may be useful for
+        identifying uncorrected cosmic rays. 
+        
+        ________ 
+        Returns:
+            inds_JK: ndarray
+                1D array of indices (length nRef), where entries of i indicate
+                the reference images excluded from rescube_JK[i].
+            rescube_JK: ndarray
+                4D array of shape (nJK, nRolls, ny, nx), where nJK=nVis if
+                exclude_by_visitid and nJK=nRef otherwise, containing the
+                residuals from each jackknife reduction. If derotate is True,
+                the residuals are derotated
+
+        if self.prop_err is True, also returns:
+            errcube_JK: ndarray
+                4D array of propagated uncertainties from the ERR FITS
+                extensions for each jackknife reduction. 
+        """
+        nRef = self.imcube_ref.shape[0]
+        nOpt = self.optzones.shape[0]
+
+        init_refmask = self.rdi_settings.get('ref_mask')
+
+        jk_refmask = np.ones((nOpt, nRef), dtype='bool')
+
+        if exclude_by_visitid:
+            uVisIDs, inds_JK = np.unique(self._visit_ids_ref, return_inverse=True)
+            nJK = len(uVisIDs)
+        else:
+            inds_JK = np.arange(nRef)
+            nJK = nRef
+        
+        rescube_JK = np.zeros((nJK, *self.imcube_sci.shape), self.imcube_sci.dtype)
+        if self.prop_err:
+            errcube_JK = np.zeros_like(rescube_JK)
+
+        for i in (tqdm(np.unique(inds_JK), leave=False) if show_progress else np.unique(inds_JK)):
+            jk_refmask[:,:] = np.invert(inds_JK == i)
+            self.rdi_settings['ref_mask'] = jk_refmask
+            hcube_res, err_hcube_res, _ = self.run_rdi(derotate=derotate, return_res_only=True)
+            rescube_JK[i] = hcube_res[:,0]
+            if self.prop_err:
+                errcube_JK[i] = err_hcube_res[:,0]
+
+        out = [inds_JK, rescube_JK]
+        if self.prop_err:
+            out.append(errcube_JK)
+        if init_refmask is None:
+            del self.rdi_settings['ref_mask']
+        else:
+            self.rdi_settings['ref_mask'] = init_refmask
+        return out
+
+
+    def run_deconvolution(self, reduc_in=None, num_iter=500, epsilon='auto', auto_eps_errtol=1e-3, return_iters=None,
+                          init_from_reduc=False, excl_mask_in=None, output_suffix='deconv', save_products=False, show_progress=True):
+        """
+        Perform deconvolution using a variant of the Richardson Lucy algorithm,
+        adapted for shift-variant coronagraphic observations. Requires that
+        prepare_convolution has been run. 
+        
+        ___________ 
+        Parameters:
+        
+        reduc_in: SpaceReduction, optional 
+            If provided, it must be a derotated reduction for the currently
+            loaded concatenation. If not provided, an HPFRDI reduction will be
+            run using the current opt/sub zones.
+
+        num_iter: int, optional
+            The number of deconvolution iterations to run. Default is 500.
+
+        epsilon: float or 'auto', optional
+            The correction threshold for deconvolution. If not None, no
+            corrections will be applied to any pixels with absolute values less
+            than epsilon. Larger values of epsilon will decrease noise
+            (resulting from division by values very near zero) in final
+            results, but may also decrease the accuracy of the deconvolution.
+            If 'auto' and if self.prop_err, epsilon will be set to
+            auto_eps_errtol times the median pixel error from reduc.err_rolls.
+            If 'auto' but not self.prop_err, epsilon will be set to
+            auto_eps_errtol times the median absolute deviation for
+            reduc.rolls. Default is 'auto'.
+
+        auto_eps_errtol: float, optional
+            When epsilon is 'auto', this factor will be used to set the
+            threshold for deconvolution; effectively the number of standard
+            deviations below which no corrections should be considered. Default
+            is 1e-3.
+
+        return_iters: array-like, optional
+            If provided, an array of integers indicating the iteration numbers
+            that should be returned (in addition to the final result). Helpful
+            for diagnosing issues (and for making neat animations!). Default is
+            None.
+            
+        init_from_reduc: bool, optional
+            If True, the 0th iteration for deconvolution is the input image
+            being deconvolved. Otherwise, a uniform image of values equaling
+            the median of all positive pixels is used. Can speed convergence
+            but is less robust to artifacts in the input image. Should be used
+            only with particularly clean reductions. Default is False. 
+
+        excl_mask_in: ndarray, optional
+            A boolean mask of the same shape as the input image, where values
+            of True indicate pixels that should NOT be corrected during
+            deconvolution (in addition to any NaNs in the original image and
+            any values excluded by epsilon). Default is None.
+
+        output_suffix: str, optional
+            String appended to the reduction's output_ext attribute for output
+            of deconvolved results. Default is 'deconv'.
+
+        save_products: bool, optional
+            Whether to save the deconvolved products to FITS files. Default is
+            False.
+
+        show_progress: bool, optional
+            Whether to show progress bars during the deconvolution. Default is
+            True.
+
+        _____
+        Notes:
+
+        If custom functions are being used for transmission_map_fn and/or
+        grid_inds_fn, they must take additional arguments: the position angle
+        by which to derotate and and the position of the star. See
+        convolution.get_jwst_psf_grid_inds and
+        convolution.get_jwst_coron_transmission_map for reference.
+
+        ________
+        Returns:
+            products: SpaceReduction
+                A SpaceReduction object containing the deconvolved image and
+                residuals. If save_products is True, the result will be saved
+                to a FITS file as well.
+            
+            if reduc_in is None:
+                reduc: SpaceReduction
+                    The HPFRDI reduction used as input for the deconvolution.
+
+            if return_iters is not None:
+                deconv_iters: ndarray
+                    A 3D array of shape (len(return_iters), ny, nx) containing
+                    the deconvolved images at the iteration numbers specified by
+                    return_iters.
+        """
+        if reduc_in is None:
+            self.hpfrdi_presets()
+            reduc = self.run_rdi(save_products=False)
+        else:
+            reduc = reduc_in
+
+        reduc_label = f'Deconv {reduc.reduc_label}'
+
+        if self.convolver is None or self.convolver.psfs is None:
+                raise ValueError("""
+                    To run deconvolution, you must first execute
+                    prepare_convolution.
+                                """)
+
+        deconv_psfs = np.array([webbpsf_ext.image_manip.frebin(rotate_image(self.convolver.psfs, -posang, cval0=0.), scale=1/self.convolver.osamp, total=True) for posang in self._posangs_sci])
+        deconv_coron_tmaps = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.coron_tmaps_osamp.dtype)
+        deconv_psf_inds = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.psf_inds_osamp.dtype)
+        for i,c_coron in enumerate(self.c_coron_sci):
+            deconv_psf_inds[i] = self.convolver.grid_inds_fn(c_coron, self.convolver.psf_offsets_polar, 1, shape=(self.ny, self.nx), 
+                                                                pxscale=self.convolver.pxscale, posang=self._posangs_sci[i], c_star=reduc.c_star)
+
+            deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=False,
+                                                                            osamp=self.convolver.osamp, nd_squares=False, 
+                                                                            shape=(self.ny, self.nx), posang=self._posangs_sci[i],
+                                                                            c_star=reduc.c_star)
+
+        if epsilon == 'auto':
+            if reduc.err_rolls is None:
+                epsilon = auto_eps_errtol*np.nanmedian(reduc.err_rolls)
+            else:
+                epsilon = auto_eps_errtol*nan_median_absolute_deviation(reduc.rolls)
+
+        rolls_deconv = np.zeros_like(reduc.rolls)
+        if return_iters is not None:
+            deconv_iters = np.zeros((len(return_iters), *reduc.rolls.shape), dtype=reduc.rolls.dtype)
+
+        iterator = reduc.rolls
+        if show_progress:
+            iterator = tqdm(iterator, leave=False)
+        for i,image in enumerate(iterator):
+            init_nans = np.isnan(image)
+            image_in, nans = image.copy(), init_nans.copy()
+            while np.any(nans):
+                image_in = convolution.interpolate_replace_nans(image_in, np.ones((5,5)), convolution.convolve_fft)
+                nans = np.isnan(image_in)
+            excl_mask = init_nans.copy()
+            if excl_mask_in is not None:
+                excl_mask |= excl_mask_in
+
+            if init_from_reduc:
+                im_deconv_in = image_in.copy()
+            else:
+                im_deconv_in = None
+
+            out = coronagraphic_richardson_lucy(image_in, deconv_psfs[i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i], num_iter=num_iter,
+                                                im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters, use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask,
+                                                show_progress=show_progress)
+            if return_iters is None:
+                rolls_deconv[i] = np.where(excl_mask_in, image, out)
+                rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
+            else:
+                rolls_deconv[i], deconv_iters[:,i] = np.where(excl_mask_in, image, out[0]), np.where(excl_mask_in, image, out[1])
+                rolls_deconv[i], deconv_iters[:,i] = np.where(init_nans, np.nan, rolls_deconv[i]), np.where(init_nans, np.nan, deconv_iters[:,i])
+
+        im_deconv = np.nanmedian(rolls_deconv, axis=0)
+        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv, c_star_out=reduc.c_star, output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)
+        if save_products:
+            try:
+                products.save(overwrite=self.overwrite)
+            except OSError:
+                raise OSError("""
+                      A FITS file for this output_ext + output_dir + concat
+                      already exists! To overwrite existing files, set the
+                      overwrite attribute for your Winnie SpaceRDI instance to
+                      True. Alternatively, either change the output_ext
+                      attribute for your SpaceRDI instance, or select a
+                      different output directory when initializing your
+                      SpaceKLIP database object.
+                      """)
+                      
+        if return_iters is None and reduc_in is not None:
+            return products
+
+        out = [products]
+        if reduc_in is None:
+            out.append(reduc)
+        if return_iters is not None:
+            out.append(deconv_iters)
+        return out
+
+
+    def _check_smoothed_nans(self):
+        """
+        If we're using smoothing during optimization and zero_nans isn't
+        already set to True, see if there's any NaNs in our optzones after smoothing. 
+        If so, add zero_nans=True to our settings to avoid all-NaN results.
+        """
+        if 'opt_smoothing_fn' in self.rdi_settings and not self.rdi_settings.get('zero_nans', False):
+            sci_filt = self.rdi_settings['opt_smoothing_fn'](self.imcube_sci, **self.rdi_settings['opt_smoothing_kwargs'])
+            ref_filt = self.rdi_settings['opt_smoothing_fn'](self.imcube_ref, **self.rdi_settings['opt_smoothing_kwargs'])
+            allopt = np.any(self.optzones, axis=0)
+            nans = np.any([*np.isnan(sci_filt[..., allopt]), *np.isnan(ref_filt[..., allopt])])
+            if nans: 
+                self.rdi_settings['zero_nans'] = True
+
+
+    def _from_fits(self, input):
+        if isinstance(input, fits.ImageHDU):
+            p_in = input.data.astype('int64').tolist()
+        else:
+            with fits.open(input) as hdul:
+                p_in = hdul['winnie_pickled'].data.astype('int64').tolist()
+        self.__dict__.update(pickle.loads(bytes(p_in)).__dict__)
+
+
+    def _to_fits(self):
+        """
+        Convert the SpaceRDI object to a FITS HDU for saving to a FITS file.
+        """
+        return fits.ImageHDU(list(pickle.dumps(self, pickle.HIGHEST_PROTOCOL)), name='winnie_pickled')
+
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for key in list(state.keys()):
+            if f'_{key}' in state: # Delete cropped aliases of data
+                del state[key]
+        if self.efficient_saving:
+            for key in ['_imcube_sci', '_imcube_ref', '_errcube_sci', '_errcube_ref']:
+                if key in state:
+                    del state[key]
+            if 'hcube_css' in state['rdi_settings']:
+                state['rdi_settings']['hcube_css'] = None
+        return state
+
+
+    def __setstate__(self, state):
+        self.__dict__.update(state) # Restore attributes
+        # Reload the data if efficient saving was used.
+        if self.efficient_saving: 
+            imcube_sci, errcube_sci = [],[]
+            for f in self._files_sci:
+                ints, errs = fits.getdata(f, ext=1), (fits.getdata(f, ext=2) if self.prop_err else None)
+                if np.ndim(ints.squeeze()) != 2:
+                    if self.use_robust_mean:
+                        im, err = robust_mean_combine(ints, errs, self.robust_clip_nsig)
+                    else: 
+                        im, err = median_combine(ints, errs)
+                else:
+                    im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
+                imcube_sci.append(im)
+                errcube_sci.append(err)
+            imcube_ref, errcube_ref = [],[]
+            for f in self._files_ref:
+                ints, errs = fits.getdata(f, ext=1), (fits.getdata(f, ext=2) if self.prop_err else None)
+                if np.ndim(ints.squeeze()) != 2:
+                    if self.use_robust_mean:
+                        im, err = robust_mean_combine(ints, errs, self.robust_clip_nsig)
+                    else: 
+                        im, err = median_combine(ints, errs)
+                else:
+                    im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
+                imcube_ref.append(im)
+                errcube_ref.append(err)
+            self._imcube_sci = np.array(imcube_sci)
+            self._imcube_ref = np.array(imcube_ref)
+            self._errcube_sci = np.array(errcube_sci)
+            self._errcube_ref = np.array(errcube_ref)
+            if self.pad_data is not None:
+                self._imcube_sci = np.pad(self._imcube_sci, self._imc_padding, constant_values=np.nan)
+                self._imcube_ref = np.pad(self._imcube_ref, self._imc_padding, constant_values=np.nan)
+                self._errcube_sci = np.pad(self._errcube_sci, self._imc_padding, constant_values=np.nan) if self.prop_err else None
+                self._errcube_ref = np.pad(self._errcube_ref, self._imc_padding, constant_values=np.nan) if self.prop_err else None
+        self.set_crop(self.cropped_shape)
+        if self.efficient_saving and 'hcube_css' in self.rdi_settings:
+            self.rdi_settings['hcube_css'] = self.imcube_css[:, np.newaxis]
 
 
 class SpaceConvolution:
@@ -1044,7 +1589,9 @@ class SpaceConvolution:
                  ncores=-1, use_gpu=False, verbose=True,
                  show_plots=False, show_progress=True,
                  overwrite=True, fetch_opd_by_date=True,
-                 pad_data='auto', psfgrids_output_dir='psfgrids'):
+                 pad_data='auto', output_basedir=None,
+                 output_subdir='psfgrids',
+                 efficient_saving=True):
         
         self.database = database
         self.source_spectrum = source_spectrum
@@ -1060,9 +1607,13 @@ class SpaceConvolution:
         self._grid_fetched = False
         self.fetch_opd_by_date = fetch_opd_by_date
         self.pad_data = pad_data
-        self.psfgrids_output_dir = f'{database.output_dir}{psfgrids_output_dir}/'
-        if not os.path.isdir(self.psfgrids_output_dir):
-            os.makedirs(self.psfgrids_output_dir)
+        self.efficient_saving = efficient_saving
+        self.output_basedir = self.database.output_dir if output_basedir is None else output_basedir
+        self.output_dir = f'{output_basedir}{output_subdir}/'
+        if not os.path.isdir(self.output_basedir):
+            os.makedirs(self.output_basedir)
+        if not os.path.isdir(self.output_dir):
+            os.makedirs(self.output_dir)
         if self.use_gpu:
             print("Warning! GPU implementation still in progress; setting use_gpu to False.")
             self.use_gpu = False
@@ -1073,6 +1624,7 @@ class SpaceConvolution:
                     cropped_shape=None, grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                     grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
                     transmission_map_fn=get_jwst_coron_transmission_map, transmission_map_kwargs={}):
+
         if isinstance(concat, numbers.Number):
             concat_str = list(self.database.obs.keys())[concat]
         else:
@@ -1119,14 +1671,14 @@ class SpaceConvolution:
             visit_ids.append(h0['VISIT_ID'])
             c_coron.append(self._c_star-offset)
         
-        reference_file = files[reference_index]
+        self.reference_file = files[reference_index]
 
-        self.image_mask = header0['CORONMSK'].replace('MASKA', 'MASK').replace('4QPM_', 'FQPM')
-        self.aperturename = header0['APERNAME']
-        self.pps_aper = header0['PPS_APER']
-        self.filt = header0['FILTER']
+        self.image_mask = db_tab[0]['CORONMSK'].replace('MASKA', 'MASK').replace('4QPM_', 'FQPM').replace('LYOT_2300', 'LYOT2300')
+        self.aperturename = db_tab[0]['APERNAME']
+        self.pps_aper = db_tab[0]['PPS_APER']
+        self.filt = db_tab[0]['FILTER']
         self.channel = header0.get('CHANNEL', None)
-        self.instrument = header0['INSTRUME']
+        self.instrument = db_tab[0]['INSTRUME']
         self.date = header0['DATE-BEG']
         if 'PUPIL' in header0:
             self.pupil_mask = header0['PUPIL']
@@ -1156,17 +1708,17 @@ class SpaceConvolution:
         if self.pad_data is not None: self._apply_padding()
 
         # Will eventually store these data in a more mutable format
-        if self.channel == 'SHORT' and self.image_mask == 'MASK335R':
+        if self.image_mask == 'MASK210R':
             webbpsf_options = dict(
                 pupil_shift_x = -0.0045,
                 pupil_shift_y = -0.0022,
                 pupil_rotation = -0.38)
-        elif self.channel == 'LONG' and self.image_mask == 'MASK335R':
+        elif self.image_mask == 'MASK335R':
             webbpsf_options = dict(
                 pupil_shift_x = -0.0125,
                 pupil_shift_y = -0.008,
                 pupil_rotation = -0.595)
-        elif self.channel is None and self.image_mask == 'FQPM1140':
+        elif self.image_mask == 'FQPM1140':
             webbpsf_options = dict(
                 pupil_shift_x = 0.00957944,
                 pupil_shift_y = 0.01387777,
@@ -1178,52 +1730,26 @@ class SpaceConvolution:
         if self.pupil_mask == 'MASKBAR':
             self.pupil_mask = self.pps_aper.split('_')[1]
 
-        if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.inst_webbpsf.opd_query_date.split('T')[0] != self.date.split('T')[0]):
-            if self.pupil_mask.endswith('WB'):
-                reference_file = fits.open(reference_file)
-                reference_file[0].header['PUPIL'] = self.pupil_mask
-            self.initialize_webbpsf_instance(file=reference_file, options=webbpsf_options)
-        else: # Otherwise, update the non-OPD elements; This is more or less borrowed from webbpsf.setup_sim_to_match_file()
-            if self.inst_webbpsf is None:
-                self.inst_webbpsf = webbpsf.instrument(self.instrument)
+        self.prepare_webbpsf_instance(options=webbpsf_options)
 
-            self.inst_webbpsf.filter = self.filt
-            self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
-            if self.inst_webbpsf.name == 'NIRCam':
-                if self.pupil_mask.startswith('MASK'):
-                    self.inst_webbpsf.pupil_mask = self.pupil_mask
-                    self.inst_webbpsf.image_mask = self.image_mask                                                   
-                    self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
-            elif self.inst_webbpsf.name == 'MIRI':
-                if self.inst_webbpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
-                    self.inst_webbpsf.image_mask = 'FQPM'+self.filt[1:5]
-                elif self.inst_webbpsf.filter == 'F2300C':
-                    self.inst_webbpsf.image_mask = 'LYOT2300'
-            self.inst_webbpsf.options.update(webbpsf_options)
+        self.prepare_webbpsf_ext_instance(options=webbpsf_options)
 
-        self.inst_webbpsf.opd_query_date = self.date
-        
-        self.initialize_webbpsf_ext_instance(options=webbpsf_options)
+        self.psf_file = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
 
-        self.psf_file = '{}JWST_{}_{}_{}_{}_{}_fov{}_os{}_{}.fits'.format(self.psfgrids_output_dir,
-                                                                                header0['INSTRUME'],
-                                                                                header0['DETECTOR'],
-                                                                                header0['filter'],
-                                                                                header0['coronmsk'],
-                                                                                header0['SUBARRAY'],
-                                                                                self.fov_pixels,
-                                                                                self.osamp,
-                                                                                output_ext)
-        
         self._psf_shift = None
         self._coron_tmaps_osamp = None
         self._psf_inds_osamp = None
 
+        self.grid_fn = grid_fn
+        self.grid_kwargs = grid_kwargs
+        self.transmission_map_fn = transmission_map_fn
+        self.transmission_map_kwargs = transmission_map_kwargs
+        self.grid_inds_fn = grid_inds_fn
+        self.grid_inds_kwargs = grid_inds_kwargs
+
         self.cropped_shape = cropped_shape
         if prefetch_psf_grid:
-            self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid, grid_inds_fn=grid_inds_fn, 
-                                grid_inds_kwargs=grid_inds_kwargs, transmission_map_fn=transmission_map_fn,
-                                transmission_map_kwargs=transmission_map_kwargs, grid_fn=grid_fn, **grid_kwargs)
+            self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid)
         else:
             self._grid_fetched = False
         
@@ -1244,13 +1770,45 @@ class SpaceConvolution:
         self._nx = self._nx + dxmin_pad + dxmax_pad
 
 
-    def initialize_webbpsf_instance(self, file, options):
-        inst = webbpsf.setup_sim_to_match_file(file)
-        inst.options.update(options)
-        self.inst_webbpsf = inst
+    def prepare_webbpsf_instance(self, options):
+        # If we're setting OPD based on date and the WebbPSF instance is either
+        # not initialized or the date has changed:
+        if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.opd_query_date.split('T')[0] != self.date.split('T')[0]):
+            if self.pupil_mask.endswith('WB'):
+                reference_file = fits.open(self.reference_file)
+                reference_file[0].header['PUPIL'] = self.pupil_mask
+            else:
+                reference_file = self.reference_file
+            self.inst_webbpsf = webbpsf.setup_sim_to_match_file(reference_file)
+            self.inst_webbpsf.options.update(options)
+            self.opd_query_date = self.date
+        # Otherwise, update the non-OPD elements; This is more or less borrowed
+        # from webbpsf.setup_sim_to_match_file()
+        else: 
+            if self.inst_webbpsf is None: # if needed, initialize the WebbPSF instance
+                self.inst_webbpsf = webbpsf.instrument(self.instrument)
+            self.inst_webbpsf.filter = self.filt
+            self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
+            if self.inst_webbpsf.name == 'NIRCam':
+                if self.pupil_mask.startswith('MASK'):
+                    self.inst_webbpsf.pupil_mask = self.pupil_mask
+                    self.inst_webbpsf.image_mask = self.image_mask                                                   
+                    self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
+            elif self.inst_webbpsf.name == 'MIRI':
+                if self.inst_webbpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
+                    self.inst_webbpsf.image_mask = 'FQPM'+self.filt[1:5]
+                elif self.inst_webbpsf.filter == 'F2300C':
+                    self.inst_webbpsf.image_mask = 'LYOT2300'
+            self.inst_webbpsf.options.update(options)
+             # In case we're initializing with fetch_opd_by_date=False, we need
+             # to set a null OPD date so that if self.fetch_opd_by_date is
+             # later set to True, the OPD will be loaded when executing this
+             # method.
+            if not self.fetch_opd_by_date:
+                self.opd_query_date = '' # null date
 
     
-    def initialize_webbpsf_ext_instance(self, options):
+    def prepare_webbpsf_ext_instance(self, options):
         # Swap to prelaunch equivalent mask names for WebbPSF-ext
         if self.pupil_mask.endswith('RND'):
             pupil_mask_ext = 'CIRCLYOT'
@@ -1281,10 +1839,7 @@ class SpaceConvolution:
         self._psf_shift = get_webbpsf_model_center_offset(psf_off, osamp=4)
     
     
-    def fetch_psf_grid(self, recalc_psf_grid=False, grid_inds_fn=get_jwst_psf_grid_inds,
-                        grid_inds_kwargs={}, transmission_map_fn=get_jwst_coron_transmission_map,
-                        transmission_map_kwargs={}, grid_fn=generate_lyot_psf_grid,
-                        **grid_kwargs):
+    def fetch_psf_grid(self, recalc_psf_grid=False):
         """
         ___________
         Parameters:
@@ -1346,41 +1901,51 @@ class SpaceConvolution:
                 self.psf_offsets_polar = hdul[1].data
                 self.psf_offsets = hdul[2].data
         else:
-            if self._psf_shift is None:
-                self.calc_psf_shift()
-            out = grid_fn(self.inst_webbpsf, source_spectrum=self.source_spectrum,
-                          shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
-                          show_progress=self.show_progress, **grid_kwargs)
+            if self.grid_fn is not None:
+                if self._psf_shift is None:
+                    self.calc_psf_shift()
+                out = self.grid_fn(self.inst_webbpsf, source_spectrum=self.source_spectrum,
+                            shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
+                            show_progress=self.show_progress, **self.grid_kwargs)
+                
+                self.psfs, self.psf_offsets_polar, self.psf_offsets = out
+                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(self.psfs), 
+                                          fits.ImageHDU(self.psf_offsets_polar),
+                                          fits.ImageHDU(self.psf_offsets)])
+                hdul.writeto(self.psf_file, overwrite=True)
+            else:
+                self.psfs, self.psf_offsets_polar, self.psf_offsets = None, None, None
             
-            self.psfs, self.psf_offsets_polar, self.psf_offsets = out
-            hdul = fits.HDUList(hdus=[fits.PrimaryHDU(self.psfs), 
-                                      fits.ImageHDU(self.psf_offsets_polar),
-                                      fits.ImageHDU(self.psf_offsets)])
-            hdul.writeto(self.psf_file, overwrite=True)
-            
-        if self.blursigma != 0:
+        if self.blursigma != 0 and self.psfs is not None:
             self.psfs = gaussian_filter_sequence(self.psfs, self.blursigma*self.osamp)
             
-        if grid_inds_fn is not None:
+        self._fetch_grid_inds()
+        self._fetch_transmission_maps()
+
+        self._grid_fetched = True
+        self.set_crop(self.cropped_shape)
+
+
+    def _fetch_grid_inds(self):
+        if self.grid_inds_fn is not None:
             psf_inds_osamp = []
             for c_coron in self._c_coron_sci:
-                psf_inds = grid_inds_fn(c_coron, self.psf_offsets_polar, osamp=self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **grid_inds_kwargs)
+                psf_inds = self.grid_inds_fn(c_coron, self.psf_offsets_polar, osamp=self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **self.grid_inds_kwargs)
                 psf_inds_osamp.append(psf_inds)
             self._psf_inds_osamp = np.asarray(psf_inds_osamp)
         else:
             self._psf_inds_osamp = None
 
-        if transmission_map_fn is not None:
+
+    def _fetch_transmission_maps(self):
+        if self.transmission_map_fn is not None:
             coron_tmaps_osamp = []
             for c_coron in self._c_coron_sci:
-                coron_tmap = transmission_map_fn(self.inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **transmission_map_kwargs)
+                coron_tmap = self.transmission_map_fn(self.inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **self.transmission_map_kwargs)
                 coron_tmaps_osamp.append(coron_tmap)
             self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
         else:
             self._coron_tmaps_osamp = np.ones((len(self._c_coron_sci), self._ny*self.osamp, self._nx*self.osamp))
-
-        self._grid_fetched = True
-        self.set_crop(self.cropped_shape)
 
 
     def set_crop(self, cropped_shape=None):
@@ -1392,12 +1957,22 @@ class SpaceConvolution:
                 x1, y1 = max(0, int(np.round(x0-(cr_nx-1.)/2.))), max(0, int(np.round(y0-(cr_ny-1.)/2.)))
                 cr_cent = np.array([x0-x1, y0-y1])
                 self.c_star = cr_cent
-                self.coron_tmaps_osamp, _, self.crop_indices_osamp = crop_data(self._coron_tmaps_osamp,
-                                                                c_to_c_osamp(self._c_star, self.osamp),
-                                                                self.cropped_shape*self.osamp,
-                                                                return_indices=True, copy=False)
+                if self._coron_tmaps_osamp is not None:
+                    self.coron_tmaps_osamp, _, self.crop_indices_osamp = crop_data(self._coron_tmaps_osamp,
+                                                                    c_to_c_osamp(self._c_star, self.osamp),
+                                                                    self.cropped_shape*self.osamp,
+                                                                    return_indices=True, copy=False)
+                else:
+                    self.coron_tmaps_osamp = None
+                    _, _, self.crop_indices_osamp = crop_data(np.zeros((self._ny*self.osamp, self._nx*self.osamp)),
+                                                              c_to_c_osamp(self._c_star, self.osamp),
+                                                              self.cropped_shape*self.osamp,
+                                                              return_indices=True, copy=False)
                 y1o, y2o, x1o, x2o = self.crop_indices_osamp
-                self.psf_inds_osamp = self._psf_inds_osamp[..., y1o:y2o, x1o:x2o]
+                if self._psf_inds_osamp is not None:
+                    self.psf_inds_osamp = self._psf_inds_osamp[..., y1o:y2o, x1o:x2o]
+                else:
+                    self.psf_inds_osamp = None
                 self.ny, self.nx = self.cropped_shape
                 self.c_coron_sci = self._c_coron_sci - np.array([x1,y1])
                 self.c_coron_ref = self._c_coron_ref - np.array([x1,y1])
@@ -1457,11 +2032,35 @@ class SpaceConvolution:
 
         return model_con_out
 
-    
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for key in list(state.keys()):
+            if f'_{key}' in state: # Delete cropped aliases of data
+                del state[key]
+        if self.efficient_saving:
+            for key in ['psfs', 'psf_offsets_polar', 'psf_offsets', '_coron_tmaps_osamp', '_psf_inds_osamp']:
+                if key in state:
+                    del state[key]
+        if state['inst_webbpsf'] is not None and isinstance(state['inst_webbpsf'].pupilopd, fits.hdu.hdulist.HDUList):
+            state['inst_webbpsf'].pupilopd = None
+        return state
+
+
+    def __setstate__(self, state):
+        self.__dict__.update(state) # Restore attributes
+        if (self.inst_webbpsf.pupilopd is None) and self.fetch_opd_by_date:
+            self.inst_webbpsf.load_wss_opd_by_date(self.opd_query_date)
+        if self._grid_fetched:
+            if self.efficient_saving: # If the grid had been fetched before, load it again
+                self.fetch_psf_grid(recalc_psf_grid=False)
+            else:
+                self.set_crop(self.cropped_shape)
+
+
 class SpaceReduction:
     def __init__(self, file_to_load=None, spacerdi=None, output_ext=None, im=None, rolls=None, err=None,
-                 err_rolls=None, c_star_out=None, concat=None, derotated=True):
-        
+                 err_rolls=None, c_star_out=None, concat=None, derotated=True, reduc_label=''):
         """
         Generates a new set of reduction products or load one that was previously saved.
         
@@ -1479,6 +2078,7 @@ class SpaceReduction:
             self.err_rolls = err_rolls
             self.c_star = c_star_out
             self.pxscale = spacerdi.pxscale
+            self.reduc_label = reduc_label
 
             if self.im is not None:
                 self.ny, self.nx = self.im.shape
@@ -1493,8 +2093,8 @@ class SpaceReduction:
                     h0 = hdul[0].header
                     h1 = hdul[1].header
                     
-                h1.update(NAXIS1=self.nx, NAXIS2=self.ny, CRPIX1=c_star_out[0]+1, CRPIX2=c_star_out[1]+1)
                 h1['PXSCALE'] = ((self.pxscale << u.arcsec/u.pixel).value, 'average pixel scale in arcsec/pixel')
+                h1.update(NAXIS1=self.nx, NAXIS2=self.ny, CRPIX1=c_star_out[0]+1, CRPIX2=c_star_out[1]+1)
 
                 c_coron_i = spacerdi.c_coron_sci[i]
                 if derotated:
@@ -1517,17 +2117,18 @@ class SpaceReduction:
                 if i == uni_visit_inds[0]:
                     self.primary_header = h0
             
-            self.filename = '{}JWST_{}_{}_{}_{}_{}_{}.fits'.format(spacerdi.database.output_dir,
-                                                                      h0['INSTRUME'],
-                                                                      h0['DETECTOR'],
-                                                                      h0['filter'],
-                                                                      h0['coronmsk'],
-                                                                      h0['SUBARRAY'],
-                                                                      output_ext)
-            
+            self.primary_header['MODE'] = reduc_label
+            self.primary_header['output_ext'] = output_ext
+
+            self.primary_header['ANNULI'] = spacerdi.optzones.shape[0]
+            self.primary_header['CRPIX1'] = c_star_out[0]+1
+            self.primary_header['CRPIX2'] = c_star_out[1]+1
+
+            self.filename = f'{spacerdi.output_dir}{spacerdi.concat}_{output_ext}_i2d.fits'
             self.image_headers = image_headers
             self.c_coron = np.array(c_coron_out)
-            
+            self.output_ext = output_ext
+
             h1_combined = self.image_headers[0].copy()
             h1_combined['CCORON1'], h1_combined['CCORON2'] = zip(np.mean(c_coron_out, axis=0)+1,
                                                                  ['axis 1 coordinate of the coron center',
@@ -1549,6 +2150,7 @@ class SpaceReduction:
                     
                 elif spacerdi is not None and output_ext is not None and spacerdi.concat is not None:
                     h0 = fits.getheader(spacerdi._files_sci[0], ext=0)
+                    concat_str = spacerdi.concat
 
                 else:
                     raise ValueError("""
@@ -1556,37 +2158,35 @@ class SpaceReduction:
                     b) a spacerdi object, output_ext, and concat, or c) a spacerdi object with a
                                      concatenation already loaded and output_ext.      
                     """)
-                file_to_load = '{}JWST_{}_{}_{}_{}_{}_{}.fits'.format(spacerdi.database.output_dir,
-                                                                         h0['INSTRUME'],
-                                                                         h0['DETECTOR'],
-                                                                         h0['filter'],
-                                                                         h0['coronmsk'],
-                                                                         h0['SUBARRAY'],
-                                                                         output_ext)
-
+                file_to_load = f'{spacerdi.output_dir}{concat_str}_{output_ext}_i2d.fits'
+                if not os.path.exists(file_to_load): # For backwards compatability
+                    file_to_load = '{}JWST_{}_{}_{}_{}_{}_{}.fits'.format(spacerdi.output_dir,
+                                                                            h0['INSTRUME'],
+                                                                            h0['DETECTOR'],
+                                                                            h0['FILTER'],
+                                                                            h0['CORONMSK'],
+                                                                            h0['SUBARRAY'],
+                                                                            output_ext)
             self.filename = file_to_load
             hdul = fits.open(file_to_load)
             self.primary_header = hdul[0].header
             self.im = (hdul['SCI'].data if 'SCI' in hdul else None)
             self.err = (hdul['ERR'].data if 'ERR' in hdul else None)
-            
+            self.reduc_label = self.primary_header.get('MODE', 'UNKNOWN (Winnie)') # backwards compatability
+            if output_ext is None:
+                self.output_ext = self.primary_header.get('output_ext', self.filename.split(concat_str)[-1][1:].replace('.fits', '')) # backwards compatability
+            else:
+                self.output_ext = output_ext
             self.rolls = []
             self.err_rolls = []
             self.image_headers = []
             
-            # We can usually assume either 1 or 2 rolls... but just in case:
-            end_of_rolls = False
-            i = 1
-            while not end_of_rolls:
-                if f'SCI_ROLL{i}' in hdul:
-                    self.image_headers.append(hdul[f'SCI_ROLL{i}'].header)
-                    if hdul[f'SCI_ROLL{i}'].data is not None:
-                        self.rolls.append(hdul[f'SCI_ROLL{i}'].data)
-                    if f'ERR_ROLL{i}' in hdul:
-                        self.err_rolls.append(hdul[f'ERR_ROLL{i}'].data)
-                    i += 1
-                else:
-                    end_of_rolls = True
+            for hdu in hdul:
+                if hdu.name.startswith('SCI_ROLL'):
+                    self.rolls.append(hdu.data)
+                    self.image_headers.append(hdu.header)
+                elif hdu.name.startswith('ERR_ROLL'):
+                    self.err_rolls.append(hdu.data)
 
             if len(self.rolls) == 0:
                 self.rolls = None
@@ -1602,12 +2202,13 @@ class SpaceReduction:
             self.c_star = np.array([self.combined_image_header['CRPIX1'], self.combined_image_header['CRPIX2']])-1
             self.c_coron = np.array([[h1['CCORON1'], h1['CCORON2']] for h1 in self.image_headers])-1
             self.pxscale = self.image_headers[0]['PXSCALE']*u.arcsec/u.pixel
-
+            
             if self.im is not None:
                 self.ny, self.nx = self.im.shape
             else:
                 self.ny, self.nx = self.rolls.shape[1:]
 
+            hdul.close()
         self.extent = mpl_centered_extent([self.ny, self.nx], self.c_star, self.pxscale)
     
 
@@ -1634,12 +2235,13 @@ class SpaceReduction:
             # Save extensions with just the header info
             for i,h1 in enumerate(copy(self.image_headers)):
                 hdul.append(fits.ImageHDU(data=None, header=h1, name=f'SCI_ROLL{i+1}'))
+        
         return hdul
 
 
-    def save(self, overwrite=False):
+    def save(self, overwrite=False, extra_hdus=[]):
         hdul = self.to_hdulist()
-                
+        hdul += fits.HDUList(extra_hdus)
         try:
             hdul.writeto(self.filename, overwrite=overwrite)
         except OSError:

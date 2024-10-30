@@ -4,7 +4,7 @@ description = "RDI PSF subtraction and forward modeling for high-contrast imagin
 authors = [{ name = "Kellen Lawson", email = "kellenlawson@gmail.com" },]
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
     "Programming Language :: Python",
@@ -16,12 +16,11 @@ dependencies = [
     "jwst",
     "matplotlib",
     "numpy",
-    "pyklip @ git+https://bitbucket.org/pyKLIP/pyklip.git@jwst",
+    "pyklip",
     "scipy",
-    "spaceKLIP @ git+https://github.com/kammerje/spaceKLIP.git@develop",
+    "spaceKLIP",
     "tqdm",
-    "webbpsf @ git+https://github.com/spacetelescope/webbpsf.git@develop",
-    "webbpsf_ext @ git+https://github.com/JarronL/webbpsf_ext.git@develop",
+    "photutils"
     ]
 
 
