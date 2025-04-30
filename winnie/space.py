@@ -6,12 +6,15 @@ import numbers
 from copy import (copy, deepcopy)
 import astropy.units as u
 import os
-import webbpsf
-import webbpsf_ext
 import pickle
 from spaceKLIP.database import Database as spaceklip_database
 from tqdm.auto import tqdm
-
+import webbpsf_ext
+try:
+    import stpsf
+except ModuleNotFoundError:
+    import webbpsf as stpsf
+    
 from .rdi import (rdi_residuals, build_annular_rdi_zones)
 
 from .plot import (mpl, plt, quick_implot, mpl_centered_extent)
@@ -27,7 +30,7 @@ from .convolution import (convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
                           get_jwst_coron_transmission_map,
                           generate_lyot_psf_grid,
-                          get_webbpsf_model_center_offset)
+                          get_stpsf_model_center_offset)
 
 from .deconvolution import (coronagraphic_richardson_lucy)
 
@@ -183,6 +186,7 @@ class SpaceRDI:
             self.prop_err = prop_err
             self.use_robust_mean = use_robust_mean
             self.robust_clip_nsig = robust_clip_nsig
+            self._imc_padding = None
             self.pad_data = pad_data
             self.pad_before_derot = pad_before_derot
             self.r_opt = r_opt
@@ -473,7 +477,7 @@ class SpaceRDI:
                 raise ValueError("""
                     Forward modeling with run_rdi is not valid when using fixed
                     RDI coefficients. For classical RDI, the output from the
-                    derotate_and_combine_cssmodel method is likely more
+                    derotate_and_combine_circumstellar_model method is likely more
                     appropriate.
                     """)
             if self.imcube_css is None:
@@ -550,7 +554,7 @@ class SpaceRDI:
                                   c_star_out=c_derot, 
                                   output_ext=output_ext,
                                   derotated=derotate,
-                                  reduc_label=self.reduc_label)
+                                  reduc_label=reduc_label)
         if save_products:
             if self.save_instance and not forward_model:
                 extra_hdus = [self._to_fits()]
@@ -854,7 +858,7 @@ class SpaceRDI:
             The source spectrum to use for generating PSFs for convolution.
         reference_index : int, optional
             The index of the science exposure that will be used to initialize
-            the WebbPSF instrument object with WebbPSF's
+            the STPSF instrument object with STPSF's
             setup_sim_to_match_file function.
         fov_pixels : int, optional
             The number of pixels in the field of view. Default is 151.
@@ -897,10 +901,10 @@ class SpaceRDI:
           samples (relative to the coronagraph center; units of [arcsec,
           degrees]), and 3) the 2D array of shape (2,N) containing the
           cartesian coordinates of those samples (relative to the coronagraph
-          center; units of [arcsec, arcsec]). It should take a WebbPSF
+          center; units of [arcsec, arcsec]). It should take a STPSF
           instrument object as the first argument, and must have the following
           signature: 
-                grid_fn(inst_webbpsf, source_spectrum=None, shift=None,
+                grid_fn(inst_stpsf, source_spectrum=None, shift=None,
                 osamp=2, fov_pixels=151, show_progress=True, **grid_kwargs)
           See winnie.convolution.generate_lyot_psf_grid for documentation
           regarding these arguments.
@@ -1171,7 +1175,7 @@ class SpaceRDI:
         return products
 
     
-    def make_css_subtracted_residuals(self, data_reduc=None, model_reduc=None, save_products=True):
+    def make_css_subtracted_residuals(self, data_reduc=None, model_reduc=None, save_products=True, output_suffix='csssub'):
         if data_reduc is None:
             data_reduc = self.run_rdi(save_products=False)
             reduc_label = f'CSS-sub {self.reduc_label}'
@@ -1179,7 +1183,7 @@ class SpaceRDI:
             reduc_label = f'CSS-sub {data_reduc.reduc_label}'
         if model_reduc is None:
             model_reduc = self.run_rdi(save_products=False, forward_model=True)
-        output_ext = data_reduc.output_ext+'_csssub'
+        output_ext = f'{data_reduc.output_ext}_{output_suffix}'
         products = SpaceReduction(spacerdi=self, im=data_reduc.im-model_reduc.im, rolls=data_reduc.rolls-model_reduc.rolls, c_star_out=data_reduc.c_star, output_ext=output_ext, reduc_label=reduc_label)
         if save_products:
             try:
@@ -1200,20 +1204,20 @@ class SpaceRDI:
         return products
 
 
-    def make_css_subtracted_stage2_products(self, subdir='css_subtracted', update_database=False):
+    def make_css_subtracted_stage2_products(self, subdir='css_subtracted', include_refs=True, update_database=False):
         """
         Creates a new subdirectory ('css_subtracted' by default) and saves the
-        science data with the current circumstellar model subtracted, along with
-        reference data and maskfiles. Optionally updates the entries in the
-        SpaceKLIP database. The outputs of this method can then be used as inputs
-        for a SpaceKLIP reduction, if preferred — e.g., to extract candidate
-        photometry. 
-        
-        WARNING: candidate photometry extracted with SpaceKLIP will only be valid
-        if the candidate source was excluded from the optimization zones used for
-        Winnie PSF subtraction, as well as from the region used for optimizing the
-        disk model. Otherwise, the source will affect the resulting disk model and
-        the source photometry will be biased.
+        science data with the current circumstellar model subtracted, along
+        with reference data (if include_refs is True) and maskfiles. Optionally
+        updates the entries in the SpaceKLIP database. The outputs of this
+        method can then be used as inputs for a SpaceKLIP reduction, if
+        preferred — e.g., to extract candidate photometry. 
+
+        WARNING: candidate photometry extracted with SpaceKLIP will only be
+        valid if the candidate source was excluded from the optimization zones
+        used for Winnie PSF subtraction, as well as from the region used for
+        optimizing the disk model. Otherwise, the source will affect the
+        resulting disk model and the source photometry will be biased.
         """
         if self.imcube_css is None:
             raise ValueError(
@@ -1227,7 +1231,10 @@ class SpaceRDI:
             os.makedirs(output_dir)
         for i,f in enumerate(self._files_sci):
             j = np.where(self.database.obs[self.concat]['FITSFILE']==f)[0][0]
-            im_css = self.imcube_css[i][self._imc_padding[1][0]:-self._imc_padding[1][1], self._imc_padding[2][0]:-self._imc_padding[2][1]]
+            if self._imc_padding is None:
+                im_css = self.imcube_css[i]
+            else:
+                im_css = self.imcube_css[i][self._imc_padding[1][0]:-self._imc_padding[1][1], self._imc_padding[2][0]:-self._imc_padding[2][1]]
             fcss_sub = output_dir+os.path.basename(os.path.normpath(f))
             with fits.open(f) as hdul:
                 hdul['SCI'].data -= im_css
@@ -1241,21 +1248,22 @@ class SpaceRDI:
                 fmask_out = None
             if update_database:
                 self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
-        for i,f in enumerate(self._files_ref):
-            j = np.where(self.database.obs[self.concat]['FITSFILE']==f)[0][0]
-            fcss_sub = output_dir+os.path.basename(os.path.normpath(f))
-            with fits.open(f) as hdul:
-                hdul.writeto(fcss_sub, overwrite=True)
-                
-            fmask = self.database.obs[self.concat]['MASKFILE'][j]
-            if fmask is not None:
-                fmask_out = output_dir+os.path.basename(os.path.normpath(fmask))
-                with fits.open(fmask) as hdul:
-                    hdul.writeto(fmask_out, overwrite=True)
-            else:
-                fmask_out = None
-            if update_database:
-                self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
+        if include_refs:
+            for i,f in enumerate(self._files_ref):
+                j = np.where(self.database.obs[self.concat]['FITSFILE']==f)[0][0]
+                fcss_sub = output_dir+os.path.basename(os.path.normpath(f))
+                with fits.open(f) as hdul:
+                    hdul.writeto(fcss_sub, overwrite=True)
+
+                fmask = self.database.obs[self.concat]['MASKFILE'][j]
+                if fmask is not None:
+                    fmask_out = output_dir+os.path.basename(os.path.normpath(fmask))
+                    with fits.open(fmask) as hdul:
+                        hdul.writeto(fmask_out, overwrite=True)
+                else:
+                    fmask_out = None
+                if update_database:
+                    self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
         
 
     def jackknife_references(self, derotate=False, exclude_by_visitid=True, show_progress=True):
@@ -1328,7 +1336,7 @@ class SpaceRDI:
 
 
     def run_deconvolution(self, reduc_in=None, num_iter=500, epsilon='auto', auto_eps_errtol=1e-3, return_iters=None,
-                          init_from_reduc=False, excl_mask_in=None, output_suffix='deconv', save_products=False, show_progress=True):
+                          init_from_reduc=False, excl_mask_in=None, psf_crop_pixels=None, output_suffix='deconv', save_products=False, show_progress=True):
         """
         Perform deconvolution using a variant of the Richardson Lucy algorithm,
         adapted for shift-variant coronagraphic observations. Requires that
@@ -1445,6 +1453,10 @@ class SpaceRDI:
                                                                             osamp=self.convolver.osamp, nd_squares=False, 
                                                                             shape=(self.ny, self.nx), posang=self._posangs_sci[i],
                                                                             c_star=reduc.c_star)
+
+        if psf_crop_pixels is not None:
+            cpsf = 0.5*(np.array([*deconv_psfs.shape[-2:]])-1)[::-1]
+            deconv_psfs, _ = crop_data(deconv_psfs, cpsf, [psf_crop_pixels, psf_crop_pixels])
 
         if epsilon == 'auto':
             if reduc.err_rolls is None:
@@ -1616,7 +1628,7 @@ class SpaceConvolution:
         self.overwrite = overwrite
         self.show_progress = show_progress
         self.concat = None
-        self.inst_webbpsf = None
+        self.inst_stpsf = None
         self.inst_webbpsfext = None
         self._grid_fetched = False
         self.fetch_opd_by_date = fetch_opd_by_date
@@ -1723,30 +1735,30 @@ class SpaceConvolution:
 
         # Will eventually store these data in a more mutable format
         if self.image_mask == 'MASK210R':
-            webbpsf_options = dict(
+            stpsf_options = dict(
                 pupil_shift_x = -0.0045,
                 pupil_shift_y = -0.0022,
                 pupil_rotation = -0.38)
         elif self.image_mask == 'MASK335R':
-            webbpsf_options = dict(
+            stpsf_options = dict(
                 pupil_shift_x = -0.0125,
                 pupil_shift_y = -0.008,
                 pupil_rotation = -0.595)
         elif self.image_mask == 'FQPM1140':
-            webbpsf_options = dict(
+            stpsf_options = dict(
                 pupil_shift_x = 0.00957944,
                 pupil_shift_y = 0.01387777,
                 pupil_rotation = -0.10441008,
                 defocus_waves = 0.01478258)
         else:
-            webbpsf_options = {}
+            stpsf_options = {}
 
         if self.pupil_mask == 'MASKBAR':
             self.pupil_mask = self.pps_aper.split('_')[1]
 
-        self.prepare_webbpsf_instance(options=webbpsf_options)
+        self.prepare_stpsf_instance(options=stpsf_options)
 
-        self.prepare_webbpsf_ext_instance(options=webbpsf_options)
+        self.prepare_webbpsf_ext_instance(options=stpsf_options)
 
         self.psf_file = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
 
@@ -1784,36 +1796,36 @@ class SpaceConvolution:
         self._nx = self._nx + dxmin_pad + dxmax_pad
 
 
-    def prepare_webbpsf_instance(self, options):
-        # If we're setting OPD based on date and the WebbPSF instance is either
+    def prepare_stpsf_instance(self, options):
+        # If we're setting OPD based on date and the STPSF instance is either
         # not initialized or the date has changed:
-        if self.fetch_opd_by_date and (self.inst_webbpsf is None or self.opd_query_date.split('T')[0] != self.date.split('T')[0]):
+        if self.fetch_opd_by_date and (self.inst_stpsf is None or self.opd_query_date.split('T')[0] != self.date.split('T')[0]):
             if self.pupil_mask.endswith('WB'):
                 reference_file = fits.open(self.reference_file)
                 reference_file[0].header['PUPIL'] = self.pupil_mask
             else:
                 reference_file = self.reference_file
-            self.inst_webbpsf = webbpsf.setup_sim_to_match_file(reference_file)
-            self.inst_webbpsf.options.update(options)
+            self.inst_stpsf = stpsf.setup_sim_to_match_file(reference_file)
+            self.inst_stpsf.options.update(options)
             self.opd_query_date = self.date
         # Otherwise, update the non-OPD elements; This is more or less borrowed
-        # from webbpsf.setup_sim_to_match_file()
+        # from stpsf.setup_sim_to_match_file()
         else: 
-            if self.inst_webbpsf is None: # if needed, initialize the WebbPSF instance
-                self.inst_webbpsf = webbpsf.instrument(self.instrument)
-            self.inst_webbpsf.filter = self.filt
-            self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
-            if self.inst_webbpsf.name == 'NIRCam':
+            if self.inst_stpsf is None: # if needed, initialize the STPSF instance
+                self.inst_stpsf = stpsf.instrument(self.instrument)
+            self.inst_stpsf.filter = self.filt
+            self.inst_stpsf.set_position_from_aperture_name(self.aperturename)
+            if self.inst_stpsf.name == 'NIRCam':
                 if self.pupil_mask.startswith('MASK'):
-                    self.inst_webbpsf.pupil_mask = self.pupil_mask
-                    self.inst_webbpsf.image_mask = self.image_mask                                                   
-                    self.inst_webbpsf.set_position_from_aperture_name(self.aperturename)
-            elif self.inst_webbpsf.name == 'MIRI':
-                if self.inst_webbpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
-                    self.inst_webbpsf.image_mask = 'FQPM'+self.filt[1:5]
-                elif self.inst_webbpsf.filter == 'F2300C':
-                    self.inst_webbpsf.image_mask = 'LYOT2300'
-            self.inst_webbpsf.options.update(options)
+                    self.inst_stpsf.pupil_mask = self.pupil_mask
+                    self.inst_stpsf.image_mask = self.image_mask                                                   
+                    self.inst_stpsf.set_position_from_aperture_name(self.aperturename)
+            elif self.inst_stpsf.name == 'MIRI':
+                if self.inst_stpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
+                    self.inst_stpsf.image_mask = 'FQPM'+self.filt[1:5]
+                elif self.inst_stpsf.filter == 'F2300C':
+                    self.inst_stpsf.image_mask = 'LYOT2300'
+            self.inst_stpsf.options.update(options)
              # In case we're initializing with fetch_opd_by_date=False, we need
              # to set a null OPD date so that if self.fetch_opd_by_date is
              # later set to True, the OPD will be loaded when executing this
@@ -1845,12 +1857,12 @@ class SpaceConvolution:
     
 
     def calc_psf_shift(self):
-        inst_off = deepcopy(self.inst_webbpsf)
+        inst_off = deepcopy(self.inst_stpsf)
         inst_off.image_mask = None
         psf_off = inst_off.calc_psf(source=None,
                                     oversample=4,
                                     fov_pixels=35)[2].data
-        self._psf_shift = get_webbpsf_model_center_offset(psf_off, osamp=4)
+        self._psf_shift = get_stpsf_model_center_offset(psf_off, osamp=4)
     
     
     def fetch_psf_grid(self, recalc_psf_grid=False):
@@ -1884,10 +1896,10 @@ class SpaceConvolution:
           samples (relative to the coronagraph center; units of [arcsec,
           degrees]), and 3) the 2D array of shape (2,N) containing the
           cartesian coordinates of those samples (relative to the coronagraph
-          center; units of [arcsec, arcsec]). It should take a WebbPSF
+          center; units of [arcsec, arcsec]). It should take an STPSF
           instrument object as the first argument, and must have the following
           signature: 
-                grid_fn(inst_webbpsf, source_spectrum=None, shift=None,
+                grid_fn(inst_stpsf, source_spectrum=None, shift=None,
                 osamp=2, fov_pixels=151, show_progress=True, **grid_kwargs)
           See winnie.convolution.generate_lyot_psf_grid for documentation
           regarding these arguments.
@@ -1918,7 +1930,7 @@ class SpaceConvolution:
             if self.grid_fn is not None:
                 if self._psf_shift is None:
                     self.calc_psf_shift()
-                out = self.grid_fn(self.inst_webbpsf, source_spectrum=self.source_spectrum,
+                out = self.grid_fn(self.inst_stpsf, source_spectrum=self.source_spectrum,
                             shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
                             show_progress=self.show_progress, **self.grid_kwargs)
                 
@@ -2056,15 +2068,15 @@ class SpaceConvolution:
             for key in ['psfs', 'psf_offsets_polar', 'psf_offsets', '_coron_tmaps_osamp', '_psf_inds_osamp']:
                 if key in state:
                     del state[key]
-        if state['inst_webbpsf'] is not None and isinstance(state['inst_webbpsf'].pupilopd, fits.hdu.hdulist.HDUList):
-            state['inst_webbpsf'].pupilopd = None
+        if state['inst_stpsf'] is not None and isinstance(state['inst_stpsf'].pupilopd, fits.hdu.hdulist.HDUList):
+            state['inst_stpsf'].pupilopd = None
         return state
 
 
     def __setstate__(self, state):
         self.__dict__.update(state) # Restore attributes
-        if (self.inst_webbpsf.pupilopd is None) and self.fetch_opd_by_date:
-            self.inst_webbpsf.load_wss_opd_by_date(self.opd_query_date)
+        if (self.inst_stpsf.pupilopd is None) and self.fetch_opd_by_date:
+            self.inst_stpsf.load_wss_opd_by_date(self.opd_query_date)
         if self._grid_fetched:
             if self.efficient_saving: # If the grid had been fetched before, load it again
                 self.fetch_psf_grid(recalc_psf_grid=False)
@@ -2178,15 +2190,33 @@ class SpaceReduction:
                                                                             h0['INSTRUME'],
                                                                             h0['DETECTOR'],
                                                                             h0['FILTER'],
-                                                                            h0['CORONMSK'],
+                                                                            h0.get('CORONMSK', 'NONE'),
                                                                             h0['SUBARRAY'],
                                                                             output_ext)
+            else:
+                if output_ext is None:
+                    h0 = fits.getheader(file_to_load, ext=0)
+                    concat_str = 'JWST_{}_{}_{}_{}_{}_{}'.format(h0['INSTRUME'], 
+                                                                h0['DETECTOR'],
+                                                                h0['FILTER'],
+                                                                h0.get('PUPIL', 'NONE'),
+                                                                h0.get('CORONMSK', 'NONE').replace("MASKA", "MASK"),
+                                                                h0['SUBARRAY'])
+                                                                
+                    if concat_str not in file_to_load: # For backwards compatability
+                        concat_str = 'JWST_{}_{}_{}_{}_{}'.format(h0['INSTRUME'], 
+                                                                h0['DETECTOR'],
+                                                                h0['FILTER'],
+                                                                h0.get('CORONMSK', 'NONE'),
+                                                                h0['SUBARRAY']
+                                                                )
+
             self.filename = file_to_load
             hdul = fits.open(file_to_load)
             self.primary_header = hdul[0].header
             self.im = (hdul['SCI'].data if 'SCI' in hdul else None)
             self.err = (hdul['ERR'].data if 'ERR' in hdul else None)
-            self.reduc_label = self.primary_header.get('MODE', 'UNKNOWN (Winnie)') # backwards compatability
+            self.reduc_label = self.primary_header.get('MODE', 'UNKNOWN') # backwards compatability
             if output_ext is None:
                 self.output_ext = self.primary_header.get('output_ext', self.filename.split(concat_str)[-1][1:].replace('.fits', '')) # backwards compatability
             else:

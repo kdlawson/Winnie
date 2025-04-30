@@ -584,6 +584,43 @@ def free_gpu(*args):
     return args
 
 
+def disk_profile_xy(r, incl, pa, dphi=1.0, return_phi=False):
+    """
+    Returns cartesian coordinates (and optionally: azimuthal angles in degrees)
+    for positions along a circle of radius r with incl (deg) and pa (deg),
+    placed every dphi degrees. Output units are the same as those of r (except
+    phi, which is in degrees).
+    """
+    incl_rad, pa_rad = np.deg2rad(incl), np.deg2rad(pa)
+    phi = np.arange(0.0, 360.0, dphi, dtype=np.float32)
+    phi_rad = np.deg2rad(phi)
+    X0, Y0 = r*np.sin(phi_rad), -r*np.cos(phi_rad)*np.cos(incl_rad)
+    X = X0*np.sin(np.pi - pa_rad) + Y0*np.cos(np.pi - pa_rad)
+    Y = X0*np.cos(np.pi - pa_rad) - Y0*np.sin(np.pi - pa_rad)
+    if return_phi:
+        return X, Y, phi
+    return X, Y
+
+
+def setup_jupyter_display(width=95, fontsize=16):
+    """
+    Sets window width and markdown fontsize for Jupyter notebook. Width is % of window.
+    """
+    from IPython.display import display, HTML
+    display(HTML("<style>.container { width:"+str(width)+"% !important; }</style>"))
+    display(HTML("<style>.rendered_html { font-size: "+str(fontsize)+"px; }</style>"))
+    return None
+
+
+def source(fn):
+    """
+    Prints the source code for the function fn.
+    """
+    import inspect
+    print(inspect.getsource(fn))
+    return None
+
+
 try:
     import cupy as cp # type: ignore
     from cupyx.scipy import ndimage as cp_ndimage # type: ignore

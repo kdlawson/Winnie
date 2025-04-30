@@ -93,58 +93,57 @@ def psf_convolve_cpu(im, psf_im):
 
 def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, normalize='exit_pupil', shift=None, osamp=2, fov_pixels=201, show_progress=True):
     """
-    Creates a grid of synthetic PSFs using a WebbPSF NIRCam or MIRI WebbPSF
-    object. The spatial sampling used here is not appropriate for non-Lyot 
-    data. Portions of this code are adapted from examples in the WebbPSF-ext
-    documentation.
+    Creates a grid of synthetic PSFs using an STPSF NIRCam or MIRI object. The
+    spatial sampling used here is not appropriate for non-Lyot data. Portions
+    of this code are adapted from examples in the WebbPSF-ext documentation.
     
     ___________
     Parameters:
 
-    inst: webbpsf.webbpsf_core.NIRCam or webbpsf.webbpsf_core.MIRI
-        NIRCam or MIRI instrument object (set up appropriately for your
-        data) to use for generating PSFs.
+    inst: stpsf.stpsf_core.NIRCam or stpsf.stpsf_core.MIRI
+        NIRCam or MIRI instrument object (set up appropriately for your data)
+        to use for generating PSFs.
     
     source_spectrum: synphot spectrum, optional
         A synphot spectrum object to use when generating the PSFs.
         
     nr: int, optional
-        The number of radial PSF samples to use in the grid. Actual grid
-        will have nr+1 radial samples, since a grid point is added at
-        r,theta = (0,0).
+        The number of radial PSF samples to use in the grid. Actual grid will
+        have nr+1 radial samples, since a grid point is added at r,theta =
+        (0,0).
         
     ntheta: int, optional
         The number of azimuthal PSF samples to use in the grid.
         
     log_rscale: bool, optional
-        If True (default), radial samples are logarithmically spaced
-        (log10) between rmin and rmax arcseconds
+        If True (default), radial samples are logarithmically spaced (log10)
+        between rmin and rmax arcseconds
         
     rmin: float, optional
-        The minimum radial separation in arcseconds from the coronagraph
-        center to use for the PSF grid.
+        The minimum radial separation in arcseconds from the coronagraph center
+        to use for the PSF grid.
 
     rmax: float, optional
-        The maximum radial separation in arcseconds from the coronagraph
-        center to use for the PSF grid.
+        The maximum radial separation in arcseconds from the coronagraph center
+        to use for the PSF grid.
 
     normalize: str, optional
         The normalization to use for the PSFs. Options are 'exit_pupil'
-        (default), 'first', and 'last' (see WebbPSF documentation for more
+        (default), 'first', and 'last' (see STPSF documentation for more
         info).
 
     shift: ndarray, optional
-        The detector sampled shift (in pixels) needed to place the PSF as
-        the geometric center of the array. If None, no shift will be
-        applied and the resulting PSFs may effectively shift your models
-        during convolution.
+        The detector sampled shift (in pixels) needed to place the PSF as the
+        geometric center of the array. If None, no shift will be applied and
+        the resulting PSFs may effectively shift your models during
+        convolution.
 
     osamp: int, optional
         The oversampling factor for which to generate the synthetic PSFs
 
     fov_pixels: int, optional
-        The number of pixels for each axis of the detector-sampled PSF
-        models (returned images will be fov_pixels*osamp)
+        The number of pixels for each axis of the detector-sampled PSF models
+        (returned images will be fov_pixels*osamp)
 
     show_progress: bool, optional
         If True, display a TQDM progress bar to track progress during PSF
@@ -210,7 +209,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     return psfs, psf_offsets_polar, psf_offsets
 
 
-def get_webbpsf_model_center_offset(psf_off, osamp):
+def get_stpsf_model_center_offset(psf_off, osamp):
     """
     Returns the detector-sampled shift required to geometrically center psf_off,
     a PSF model generated with image_mask=None and with oversampling osamp.
