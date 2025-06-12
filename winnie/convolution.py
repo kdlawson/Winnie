@@ -209,12 +209,12 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     return psfs, psf_offsets_polar, psf_offsets
 
 
-def get_stpsf_model_center_offset(psf_off, osamp):
+def get_stpsf_model_center_offset(psf_off, osamp, x_sfac=1, y_sfac=2):
     """
     Returns the detector-sampled shift required to geometrically center psf_off,
     a PSF model generated with image_mask=None and with oversampling osamp.
     """
-    psf_gauss = Gaussian2DKernel(x_stddev=1*osamp, y_stddev=2*osamp).array
+    psf_gauss = Gaussian2DKernel(x_stddev=x_sfac*osamp, y_stddev=y_sfac*osamp).array
     psf_gauss *= psf_off.max() / psf_gauss.max()
     psf_crop = pad_or_crop_image(psf_off, psf_gauss.shape, cval0=0)
     psf_reg_result = imageregistration.align_array(psf_gauss, psf_crop)

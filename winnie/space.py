@@ -236,7 +236,6 @@ class SpaceRDI:
 
         files = db_tab['FITSFILE']
 
-        self._c_star = np.array([db_tab['CRPIX1'][0], db_tab['CRPIX2'][0]])-1 # Position of the star in the data before any cropping
         self.pxscale = db_tab[0]['PIXSCALE']*u.arcsec/u.pixel # pixel scale with astropy units
         self._lam = db_tab['CWAVEL'][0]*u.micron
         self._blurfwhm = np.nan_to_num(db_tab['BLURFWHM'][0])
@@ -263,8 +262,16 @@ class SpaceRDI:
                 ints = hdul[1].data
                 errs = hdul[2].data if self.prop_err else None
                 h0, h1 = hdul[0].header, hdul[1].header
+                if i == 0:
+                    if 'STARCENX' in h1:
+                        self._c_star = np.array([h1['STARCENX'], h1['STARCENY']]) - 1
+                    else:
+                        self._c_star = np.array([h1['CRPIX1'], h1['CRPIX2']]) - 1
+
                 if coron_offsets is None:
-                    if 'MASKOFFS' in hdul:
+                    if 'MASKCENX' in h1:
+                        offset = self._c_star - (np.array([h1['MASKCENX'], h1['MASKCENY']]) - 1)
+                    elif 'MASKOFFS' in hdul:
                         offset = np.mean(hdul['MASKOFFS'].data, axis=0)
                     else:
                         if i==0:
@@ -1669,7 +1676,6 @@ class SpaceConvolution:
             
         files = db_tab['FITSFILE']
 
-        self._c_star = np.array([db_tab['CRPIX1'][0], db_tab['CRPIX2'][0]])-1 # Position of the star in the data
         self.pxscale = db_tab[0]['PIXSCALE']*u.arcsec/u.pixel # pixel scale with astropy units
         self.blurfwhm = np.nan_to_num(db_tab['BLURFWHM'][0])
         self.blursigma = self.blurfwhm/np.sqrt(8.*np.log(2.))
@@ -1683,8 +1689,15 @@ class SpaceConvolution:
         for i,f in enumerate(files):
             with fits.open(f, lazy_load_hdus=True) as hdul:
                 h0, h1 = hdul[0].header, hdul[1].header
+                if i == 0:
+                    if 'STARCENX' in h1:
+                        self._c_star = np.array([h1['STARCENX'], h1['STARCENY']]) - 1
+                    else:
+                        self._c_star = np.array([h1['CRPIX1'], h1['CRPIX2']]) - 1
                 if coron_offsets is None:
-                    if 'MASKOFFS' in hdul:
+                    if 'MASKCENX' in h1:
+                        offset = self._c_star - (np.array([h1['MASKCENX'], h1['MASKCENY']]) - 1)
+                    elif 'MASKOFFS' in hdul:
                         offset = np.mean(hdul['MASKOFFS'].data, axis=0)
                     else:
                         offset = np.array([0,0])
@@ -2139,6 +2152,7 @@ class SpaceReduction:
                                                    ['axis 1 coordinate of the coron center',
                                                     'axis 2 coordinate of the coron center'])
                 
+                h1['STARCENX'], h1['STARCENY'] = h1['CRPIX1'], h1['CRPIX2']
                 image_headers.append(h1)
                 if i == uni_visit_inds[0]:
                     self.primary_header = h0
@@ -2147,8 +2161,8 @@ class SpaceReduction:
             self.primary_header['output_ext'] = output_ext
 
             self.primary_header['ANNULI'] = spacerdi.optzones.shape[0]
-            self.primary_header['CRPIX1'] = c_star_out[0]+1
-            self.primary_header['CRPIX2'] = c_star_out[1]+1
+            self.primary_header['CRPIX1'] = self.primary_header['STARCENX'] = c_star_out[0]+1
+            self.primary_header['CRPIX2'] = self.primary_header['STARCENY'] = c_star_out[1]+1
 
             self.filename = f'{spacerdi.output_dir}{spacerdi.concat}_{output_ext}_i2d.fits'
             self.image_headers = image_headers
