@@ -1,7 +1,7 @@
 import numpy as np
 import webbpsf_ext
 from jwst.coron import imageregistration
-from astropy.convolution import Gaussian2DKernel
+from astropy.convolution.kernels import (Gaussian2DKernel, _round_up_to_odd_integer)
 from .utils import (pad_or_crop_image, xy_polar_ang_displacement, c_to_c_osamp, rotate_image)
 import astropy.units as u
 from scipy import signal
@@ -129,8 +129,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
 
     normalize: str, optional
         The normalization to use for the PSFs. Options are 'exit_pupil'
-        (default), 'first', and 'last' (see STPSF documentation for more
-        info).
+        (default), 'first', and 'last' (see STPSF documentation for more info).
 
     shift: ndarray, optional
         The detector sampled shift (in pixels) needed to place the PSF as the
@@ -162,7 +161,31 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
             An array of shape (2,Nsamples) providing the (x,y) offset from the
             coronagraph center for each PSF sample in "psfs" in units of
             arcsec.
+
+    Note: Currently, when computing weights from a source spectrum, STPSF's
+    throughput for NIRCam a) assumes the mean of modules A and B, and b) does
+    not account for the coronagraphic substrate transmission. For now, we're
+    using a filter profile from WebbPSF-ext and computing our own weights
+    instead. 
     """
+
+    if source_spectrum is None:
+        source_spectrum = stpsf.specFromSpectralType('G2V')
+
+    if isinstance(source_spectrum, dict): # Assume it's already a dictionary of weights
+        source_weights = source_spectrum
+    else:
+        import stpsf
+        nlambda = inst._get_default_nlambda(inst.filter)
+        if isinstance(inst, stpsf.stpsf_core.NIRCam):
+            if inst.pupil_mask.endswith('RND'): pupil_mask_ext = 'CIRCLYOT'
+            elif inst.pupil_mask.endswith('WB'): pupil_mask_ext = 'WEDGELYOT'
+            else: pupil_mask_ext = inst.pupil_mask
+            bandpass_ext = webbpsf_ext.bandpasses.nircam_filter(inst.filter, pupil=pupil_mask_ext, mask=inst.image_mask, module=inst.module, sca=inst.detector)
+        else:
+            bandpass_ext = webbpsf_ext.bandpasses.miri_filter(inst.filter)
+        source_weights = source_spectrum_to_weights(source_spectrum, bandpass_ext, nlambda)
+
     # Set up the grid:
     if log_rscale:
         rvals = 10**(np.linspace(np.log10(rmin), np.log10(rmax), nr))
@@ -188,7 +211,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     for psf_offset in iterator:
         inst_grid.options['coron_shift_x'] = -psf_offset[0]
         inst_grid.options['coron_shift_y'] = -psf_offset[1]
-        psf = inst_grid.calc_psf(source=source_spectrum, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize)[2].data
+        psf = inst_grid.calc_psf(source=source_weights, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize)[2].data
         psfs.append(psf)
     psfs = np.array(psfs)
     
@@ -209,12 +232,14 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     return psfs, psf_offsets_polar, psf_offsets
 
 
-def get_stpsf_model_center_offset(psf_off, osamp, x_sfac=1, y_sfac=2):
+def get_stpsf_model_center_offset(psf_off, osamp, x_sfac=0.25, y_sfac=0.50):
     """
     Returns the detector-sampled shift required to geometrically center psf_off,
     a PSF model generated with image_mask=None and with oversampling osamp.
     """
-    psf_gauss = Gaussian2DKernel(x_stddev=x_sfac*osamp, y_stddev=y_sfac*osamp).array
+    x_stddev, y_stddev = x_sfac*osamp, y_sfac*osamp
+    x_size = y_size = (15 if _round_up_to_odd_integer(8*max(x_stddev,y_stddev))<15 else None)
+    psf_gauss = Gaussian2DKernel(x_stddev=x_stddev, y_stddev=y_stddev, x_size=x_size, y_size=y_size).array
     psf_gauss *= psf_off.max() / psf_gauss.max()
     psf_crop = pad_or_crop_image(psf_off, psf_gauss.shape, cval0=0)
     psf_reg_result = imageregistration.align_array(psf_gauss, psf_crop)
@@ -318,6 +343,32 @@ def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp
         return im_mask_osamp
     im_mask = webbpsf_ext.image_manip.frebin(im_mask_osamp, scale=1/osamp, total=False)
     return im_mask
+
+
+def source_spectrum_to_weights(source_spectrum, bandpass_ext, nlambda):
+    """
+    Based on the input spectrum, computes weights to be used in combining
+    monochromatic PSF slices.
+    
+    Note: This code is shamelessly copied nearly vertbatim from 
+    the _calc_psf_with_shifts method in WebbPSF-ext.
+
+    source_spectrum: synphot.spectrum.SourceSpectrum or webbpsf_ext.synphot_ext.Spectrum
+        Input spectrum for the source.
+        
+    bandpass_ext: webbpsf_ext.synphot_ext.Bandpass
+        Bandpass to use for generating weights.
+        
+    nlambda: int
+        Number of linearly spaced wavelength samples within the bandpass at
+        which to compute weights.
+    """
+    bpext_waves = bandpass_ext.waveset.to_value('um')[bandpass_ext.throughput > (0.01*bandpass_ext.throughput.max())]
+    wave_um = np.linspace(bpext_waves.min(), bpext_waves.max(), nlambda)
+    obs = webbpsf_ext.synphot_ext.Observation(source_spectrum, bandpass_ext, binset=wave_um*u.um)
+    binflux = obs.sample_binned(flux_unit='counts').value
+    weights = binflux / binflux.sum()
+    return {'wavelengths': wave_um*1e-6, 'weights': weights}
 
 
 try:

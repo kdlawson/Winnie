@@ -30,7 +30,8 @@ from .convolution import (convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
                           get_jwst_coron_transmission_map,
                           generate_lyot_psf_grid,
-                          get_stpsf_model_center_offset)
+                          get_stpsf_model_center_offset,
+                          source_spectrum_to_weights)
 
 from .deconvolution import (coronagraphic_richardson_lucy)
 
@@ -1778,6 +1779,7 @@ class SpaceConvolution:
         self._psf_shift = None
         self._coron_tmaps_osamp = None
         self._psf_inds_osamp = None
+        self._psfcube_off = None
 
         self.grid_fn = grid_fn
         self.grid_kwargs = grid_kwargs
@@ -1869,13 +1871,41 @@ class SpaceConvolution:
         self.inst_webbpsfext = inst
     
 
-    def calc_psf_shift(self):
-        inst_off = deepcopy(self.inst_stpsf)
-        inst_off.image_mask = None
-        psf_off = inst_off.calc_psf(source=None,
-                                    oversample=4,
-                                    fov_pixels=35)[2].data
-        self._psf_shift = get_stpsf_model_center_offset(psf_off, osamp=4)
+    def calc_psf_shift(self, source_spectrum=None, oversample=4, nlambda=None):
+        """
+        Determines the necessary PSF centroid shift for STPSF models given the
+        input source_spectrum.
+
+        Note: source_spectrum is needed only if you want to calculate the shift
+        for a different source spectrum than specified when initializing the
+        convolution. If None, the initial source spectrum will be used
+        (self.source_spectrum). 
+        """
+
+        if nlambda is None:
+            if self._psfcube_off is not None:
+                nlambda = self._psfcube_off.shape[0]
+            else:
+                nlambda = self.inst_stpsf._get_default_nlambda(self.inst_stpsf.filter)
+
+        if source_spectrum is None:
+            if self.source_spectrum is None: # default to sun-like spectrum, as in STPSF
+                source_spectrum = stpsf.specFromSpectralType('G2V') 
+            else:
+                source_spectrum = self.source_spectrum
+
+        if isinstance(source_spectrum, dict):
+            source_weights = source_spectrum
+        else:
+            source_weights = source_spectrum_to_weights(source_spectrum, self.inst_webbpsfext.bandpass, nlambda)
+
+        if (self._psfcube_off is None) or (self._psfcube_off.shape != (nlambda, int(oversample*35), int(oversample*35))):
+            inst_off = deepcopy(self.inst_stpsf)
+            inst_off.image_mask = None
+            self._psfcube_off = inst_off.calc_datacube(source_weights['wavelengths'], oversample=oversample, fov_pixels=35)[2].data
+
+        psf_off = np.average(self._psfcube_off, axis=0, weights=source_weights['weights'])
+        self._psf_shift = get_stpsf_model_center_offset(psf_off, osamp=oversample)
     
     
     def fetch_psf_grid(self, recalc_psf_grid=False):
@@ -1941,8 +1971,7 @@ class SpaceConvolution:
                 self.psf_offsets = hdul[2].data
         else:
             if self.grid_fn is not None:
-                if self._psf_shift is None:
-                    self.calc_psf_shift()
+                self.calc_psf_shift()
                 out = self.grid_fn(self.inst_stpsf, source_spectrum=self.source_spectrum,
                             shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
                             show_progress=self.show_progress, **self.grid_kwargs)
