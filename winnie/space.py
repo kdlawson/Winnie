@@ -550,7 +550,7 @@ class SpaceRDI:
                                   c_star_out=c_derot, 
                                   output_ext=output_ext,
                                   derotated=derotate,
-                                  reduc_label=self.reduc_label)
+                                  reduc_label=reduc_label)
         if save_products:
             if self.save_instance and not forward_model:
                 extra_hdus = [self._to_fits()]
@@ -944,6 +944,84 @@ class SpaceRDI:
         if self.concat != self.convolver.concat:
             self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
 
+    def circumstellar_model_rescale(self, return_scale=False, mask=None, 
+                                    hpf=False, filter_size=None, filter_size_adj=1,
+                                    image_rdi=None, sig=None):
+        """
+        Rescale the circumstellar model to match the median flux of the science
+        data. This is useful for forward modeling in RDI, where the model
+        should be scaled to match the observed flux level.
+
+        Parameters
+        ----------
+        return_scale : bool
+            If True, returns the scaling factor applied to the circumstellar disk model.
+        sig : ndarray or None
+            The error array to use for the RDI residuals. This is usually the `err`
+            attribute from a `SpaceReduction` class. If None, the error array from 
+            the RDI reduction generated here will be used.
+        mask : ndarray or None
+            A boolean mask to apply to the data when computing the scaling factor. 
+            True values indicate pixels to include during the scaling calculation.
+            If None, no mask is applied.
+        hpf : bool
+            If True, uses the high-pass filtered RDI residuals to compute the scaling factor.
+        filter_size : int or None
+            The filter size presets to us when generating residuals for the scaling factor.
+            If None, the default filter size `self._sigma` is used.
+        filter_size_adj : float
+            Adjustment factor for the filter size. Defaults to 1.
+        image_rdi : ndarray or None
+            Option to pass a pre-generated set of RDI residuals to calculate model scaling.
+            If None, the residuals will be generated on the fly.
+
+        """
+        from .utils import median_filter_sequence, model_rescale_factor
+        from webbpsf_ext.image_manip import crop_image
+        from copy import copy, deepcopy
+
+        if self.imcube_css is None:
+            raise ValueError(
+                """
+                Prior to executing circumstellar_model_rescale, you must first
+                set a circumstellar model using set_circumstellar_model.
+                """)
+
+        # Save current presets
+        output_ext_prev = deepcopy(self.output_ext)
+        presets_prev = copy(self.rdi_settings)
+
+        if hpf:
+            self.hpfrdi_presets(filter_size=filter_size, filter_size_adj=filter_size_adj)
+        else:
+            self.rdi_presets()
+
+        # Run RDI to get residual image
+        if image_rdi is None:
+            rdi_reduc = self.run_rdi(collapse_rolls=False)
+            image_rdi = rdi_reduc.im
+        else:
+            rdi_reduc = None
+
+        if (sig is None) and (rdi_reduc is not None):
+            sig = rdi_reduc.err
+
+        # Foward model circumstellar disk model
+        fmrdi_res = self.run_rdi(forward_model=True, collapse_rolls=False)
+        image_rdi = crop_image(image_rdi, fmrdi_res.im.shape)
+
+        footprint = np.array([[0,1,0], [1,1,1], [0,1,0]])
+        args = median_filter_sequence(np.array([image_rdi, fmrdi_res.im]), 
+                                        footprint=footprint, 
+                                        prop_threshold=0.8)
+        sfac = model_rescale_factor(*args, sig=sig, mask=mask)
+        self._imcube_css *= sfac
+
+        self.set_presets(presets=presets_prev, output_ext=output_ext_prev)
+
+        if return_scale:
+            return sfac
+
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',
                                 raw_model=None, raw_model_pxscale=None, raw_model_center=None):
@@ -1111,13 +1189,16 @@ class SpaceRDI:
 
 
     def make_derot_coron_maps(self, collapse_rolls=False, save_products=False):
+
+        from webbpsf_ext import image_manip
+
         coron_tmaps = np.zeros_like(self.imcube_sci)
         maskfiles = self.database.obs[self.concat]['MASKFILE'][self.database.obs[self.concat]['TYPE']=='SCI']
         inst = None
         for i, c_coron in enumerate(self.c_coron_sci):
             if maskfiles[i] == 'NONE' or fits.getval(maskfiles[i], 'NAXIS', ext=1) == 0:
                 if self.convolver is not None and self.convolver.coron_tmaps_osamp is not None: # Use the already-loaded transmission map
-                    coron_tmaps[i] = webbpsf_ext.image_manip.frebin(self.convolver.coron_tmaps_osamp[i], scale=1./self.convolver.osamp, total=False)
+                    coron_tmaps[i] = image_manip.frebin(self.convolver.coron_tmaps_osamp[i], scale=1./self.convolver.osamp, total=False)
                 else: # generate a transmission map image
                     if inst is None: # On first iteration, initialize our WebbPSF-ext object
                         # Swap to prelaunch equivalent mask names for WebbPSF-ext
@@ -1134,10 +1215,8 @@ class SpaceRDI:
                         inst.aperturename = self._aperturename
                     coron_tmaps[i] = get_jwst_coron_transmission_map(inst, c_coron, osamp=3, shape=(self.ny, self.nx), return_oversample=False, nd_squares=True)
             else: # Load the provided transmission map
-                coron_tmap = fits.getdata(maskfiles[i])
-                if self.pad_data is not None:
-                    coron_tmap = np.pad(coron_tmap, self._imc_padding[1:], constant_values=np.nan)
-                coron_tmaps[i] = coron_tmap
+                ny, nx = coron_tmaps.shape[-2:]
+                coron_tmaps[i] = image_manip.crop_image(fits.getdata(maskfiles[i]), (ny,nx))
         if self.pad_before_derot:
             coron_tmaps_derot, c_derot = pad_and_rotate_hypercube(coron_tmaps, -self._posangs_sci,
                                                           cent=self.c_star, ncores=self.ncores, 
