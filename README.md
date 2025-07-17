@@ -6,13 +6,6 @@ RDI PSF subtraction and forward modeling should work for any JWST coronagraphy. 
 
 Open an issue if you have any problems or want to suggest new features.
 
-## Notice: Version 1.1 Update
-
-The version 1.1 release makes a few big changes to the package that will affect
-backwards compatability. The conventions for output filenames have changed to be
-more consistent with JWST products from other packages. Loading older Winnie products back into a
-"SpaceReduction" object should still work.
-
 ## Installation
 
 #### Clone this repository:
@@ -23,12 +16,24 @@ git clone https://github.com/kdlawson/Winnie.git
 
 #### (Optional) Create a conda environment for Winnie and its dependencies, then activate it:
 
-Note: if you already have SpaceKLIP installed (from the develop branch), you can install Winnie in that environment instead to save some trouble. In this case, consider adding the --dry-run keyword after "pip install" in the commands below to be sure that the changes that pip will make are acceptable to you. If they are, rerun the command without --dry-run. If they are not, create a new environment and proceed.
+Note: if you already have SpaceKLIP installed, you can install Winnie in that environment instead to save some trouble. In this case, consider adding the --dry-run keyword after "pip install" in the commands below to be sure that the changes that pip will make are acceptable to you. If they are, rerun the command without --dry-run. If they are not, create a new environment and proceed.
 
 ```
 conda create -n winnie python=3.11
 conda activate winnie
 ```
+
+#### If it isn't already installed, install SpaceKLIP:
+
+E.g., 
+
+```
+pip install git+https://github.com/spacetelescope/spaceKLIP.git
+```
+
+Or follow instructions in the [SpaceKLIP
+documentation](https://spaceklip.readthedocs.io/en/latest/Installation-and-dependencies.html).
+
 
 #### Change directory to the cloned repository:
 
@@ -52,15 +57,25 @@ pip install .
 
 #### Install data files for dependencies:
 
-Before using Winnie, you'll need to install data files and set up environment variables required by a number of dependencies. Instructions for this are provided at the bottom of the [SpaceKLIP installation instructions](https://github.com/kammerje/spaceKLIP/tree/develop).
+Before using Winnie, you'll need to install data files and set up environment variables required by a number of dependencies. Instructions for this are provided at the bottom of the [SpaceKLIP installation instructions](https://spaceklip.readthedocs.io/en/latest/Installation-and-dependencies.html).
 
 ## Usage
 
 ### Input data:
 
-The code assumes your data were processed through the imagetools align_frames step from SpaceKLIP, such that the position of the star is the same in all images. I'd also strongly recommend coadding your integrations for each exposure before proceeding. The code will do this anyway, but is much less careful about updating header info. For a SpaceKLIP imagetools object called ImageTools, this is just:
+The code assumes your data were processed through the imagetools shift_frames
+step from SpaceKLIP (align_frames in older versions), such that the position of the star is the same in all
+images. I'd also strongly recommend coadding your integrations for each
+exposure before proceeding. The code will do this anyway, but is much less
+careful about updating header info. For a SpaceKLIP imagetools object called
+ImageTools, this is just:
 
-> ImageTools.coadd_frames(nframes=None, types=['SCI', 'SCI_BG', 'REF', 'REF_BG'], subdir='coadded')
+> ImageTools.coadd_frames()
+
+For NIRCam coronagraphy, I would also suggest running SpaceKLIP's
+NIRCam background subtraction routine as a final step:
+
+> ImageTools.subtract_nircam_coron_background()
 
 ### Example:
 

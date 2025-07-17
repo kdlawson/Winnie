@@ -197,7 +197,9 @@ def quick_implot(im, clim=None, clim_perc=[1.0, 99.0], cmap=None,
         
     if ylims is None:
         ylims = lims
-        
+
+    norm_kwargs['clip'] = norm_kwargs.get('clip', True)
+
     normalization = norm(vmin=clim[0], vmax=clim[1], **norm_kwargs)
 
     if np.ndim(im) in [2,3,4]:
