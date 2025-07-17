@@ -1228,7 +1228,7 @@ class SpaceRDI:
                     coron_tmaps[i] = get_jwst_coron_transmission_map(inst, c_coron, osamp=3, shape=(self.ny, self.nx), return_oversample=False, nd_squares=True)
             else: # Load the provided transmission map
                 ny, nx = coron_tmaps.shape[-2:]
-                coron_tmaps[i] = image_manip.crop_image(fits.getdata(maskfiles[i]), (ny,nx))
+                coron_tmaps[i] = image_manip.crop_image(fits.getdata(maskfiles[i]), (ny,nx), fill_val=np.nan)
         if self.pad_before_derot:
             coron_tmaps_derot, c_derot = pad_and_rotate_hypercube(coron_tmaps, -self._posangs_sci,
                                                           cent=self.c_star, ncores=self.ncores, 
