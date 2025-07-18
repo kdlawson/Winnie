@@ -572,6 +572,50 @@ def radial_calc_2d(im, cent, fn, fn_kwargs={}, dr=0.5, rmin=None, rmax=None, fea
     return rprof_2d
 
 
+def model_rescale_factor(A, B, sig=None, mask=None):
+    """
+    Determines the value of scalar c such that:
+        chi^2 = sum [ (A-c*B)^2 / sig^2 ]
+    is minimized.
+    
+    Parameters
+    ----------
+    A : numpy.ndarray
+        Array of measurements
+    B : numpy.ndarray
+        Array of model values. Shape must match A and B
+    sig : numpy.ndarray, optional
+        The 1 sigma uncertainty for the measurements of A.
+    mask : numpy.ndarray, optional
+        A boolean mask with False for entries of A, B, and sig not to be
+        utilized, and True for entries that are. Defaults to None.
+    Returns
+    -------
+    c : float
+        The scaling factor to multiply the model (B) by to achieve the minimum chi^2
+        for measurements (A) having the given uncertainties (sig).
+    """
+    if np.shape(A) != np.shape(B):
+        raise ValueError("A and B must be arrays of the same shape!")
+    if sig is not None:
+        if np.shape(A) != np.shape(sig):
+            raise ValueError("A, B, and sig must be arrays of the same shape if sig is specified!")
+    else:
+        sig = 1
+    if mask is None:
+        c = np.nansum(A * B / (sig ** 2)) / np.nansum((B ** 2) / (sig ** 2))
+    elif np.shape(mask)[-2:] != np.shape(A)[-2:]:
+        raise ValueError("If provided, mask's shape must match the final axes of A, B, and sig!")
+    else:
+        Amsk, Bmsk = A[..., mask], B[..., mask]
+        if np.ndim(sig) != 0:
+            Smsk = sig[..., mask]
+        else:
+            Smsk = sig
+        c = np.nansum(Amsk * Bmsk / (Smsk ** 2)) / np.nansum((Bmsk ** 2) / (Smsk ** 2))
+    return c
+
+
 def free_gpu(*args):
     N = len(args)
     args = list(args)
