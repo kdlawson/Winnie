@@ -956,9 +956,10 @@ class SpaceRDI:
         if self.concat != self.convolver.concat:
             self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
 
-    def circumstellar_model_rescale(self, return_scale=False, mask=None, 
+
+    def circumstellar_model_rescale(self, rdi_image=None, rdi_sig=None, mask=None, 
                                     hpf=False, filter_size=None, filter_size_adj=1,
-                                    image_rdi=None, sig=None):
+                                    return_scale=False, return_fm=False, **kwargs):
         """
         Rescale the circumstellar model to match the median flux of the science
         data. This is useful for forward modeling in RDI, where the model
@@ -966,9 +967,10 @@ class SpaceRDI:
 
         Parameters
         ----------
-        return_scale : bool
-            If True, returns the scaling factor applied to the circumstellar disk model.
-        sig : ndarray or None
+        rdi_image : ndarray or None
+            Option to pass a pre-generated set of RDI residuals to calculate model scaling.
+            If None, the residuals will be generated on the fly.
+        rdi_sig : ndarray or None
             The error array to use for the RDI residuals. This is usually the `err`
             attribute from a `SpaceReduction` class. If None, the error array from 
             the RDI reduction generated here will be used.
@@ -983,9 +985,10 @@ class SpaceRDI:
             If None, the default filter size `self._sigma` is used.
         filter_size_adj : float
             Adjustment factor for the filter size. Defaults to 1.
-        image_rdi : ndarray or None
-            Option to pass a pre-generated set of RDI residuals to calculate model scaling.
-            If None, the residuals will be generated on the fly.
+        return_scale : bool
+            If True, returns the scaling factor applied to the circumstellar disk model.
+        return_fm : bool
+            If True, also returns the scaled forward model RDI object.
 
         """
         from .utils import median_filter_sequence, model_rescale_factor
@@ -1009,30 +1012,43 @@ class SpaceRDI:
             self.rdi_presets()
 
         # Run RDI to get residual image
-        if image_rdi is None:
+        if rdi_image is None:
             rdi_reduc = self.run_rdi(collapse_rolls=False)
-            image_rdi = rdi_reduc.im
+            rdi_image = rdi_reduc.im
         else:
             rdi_reduc = None
 
-        if (sig is None) and (rdi_reduc is not None):
-            sig = rdi_reduc.err
+        if (rdi_sig is None) and (rdi_reduc is not None):
+            rdi_sig = rdi_reduc.err
 
         # Foward model circumstellar disk model
-        fmrdi_res = self.run_rdi(forward_model=True, collapse_rolls=False)
-        image_rdi = crop_image(image_rdi, fmrdi_res.im.shape)
+        collapse_rolls = kwargs.get('collapse_rolls', False)
+        fmrdi_reduc = self.run_rdi(forward_model=True, save_products=False, collapse_rolls=collapse_rolls)
+        fmrdi_image = crop_image(fmrdi_reduc.im, rdi_image.shape)
 
-        footprint = np.array([[0,1,0], [1,1,1], [0,1,0]])
-        args = median_filter_sequence(np.array([image_rdi, fmrdi_res.im]), 
-                                        footprint=footprint, 
-                                        prop_threshold=0.8)
-        sfac = model_rescale_factor(*args, sig=sig, mask=mask)
+        footprint = np.array([[0,1,0], 
+                              [1,1,1], 
+                              [0,1,0]])
+        args = median_filter_sequence(np.array([rdi_image, fmrdi_image]), 
+                                      footprint=footprint, 
+                                      prop_threshold=0.8)
+        sfac = model_rescale_factor(*args, sig=rdi_sig, mask=mask)
+
+        # Scale model
         self._imcube_css *= sfac
+        if return_fm:
+            fmrdi_reduc.im *= sfac
+            if collapse_rolls:
+                fmrdi_reduc.rolls *= sfac
 
         self.set_presets(presets=presets_prev, output_ext=output_ext_prev)
 
-        if return_scale:
+        if return_scale and return_fm:
+            return sfac, fmrdi_reduc
+        elif return_scale:
             return sfac
+        elif return_fm:
+            return fmrdi_reduc
 
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',
