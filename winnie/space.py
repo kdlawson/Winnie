@@ -43,8 +43,8 @@ class SpaceRDI:
                  overwrite=False, prop_err=True, show_progress=False,
                  use_robust_mean=False, robust_clip_nsig=3, pad_data='auto', 
                  pad_before_derot=False, r_opt=3*u.arcsec, r_sub=None, 
-                 save_coron_transmission=True, save_instance=False, 
-                 efficient_saving=True, from_fits=None):
+                 save_coron_transmission=True, store_settings=True, 
+                 save_instance=False, efficient_saving=True, from_fits=None):
         """
         Initialize the Winnie class for carrying out RDI on JWST data.
 
@@ -193,6 +193,7 @@ class SpaceRDI:
             self.r_opt = r_opt
             self.r_sub = r_sub
             self.save_coron_transmission = save_coron_transmission
+            self.store_settings = store_settings
             self.save_instance = save_instance
             self.efficient_saving = efficient_saving
             if self.use_gpu:
@@ -379,7 +380,7 @@ class SpaceRDI:
           and adds auto_pad_nfwhm times the effective FWHM in pixels
         - sets the cropped shape such that those separations are included in the FOV.
         """
-        if cropped_shape == 'auto':
+        if isinstance(cropped_shape, str) and cropped_shape == 'auto':
             rmax = np.max(dist_to_pt(self._c_star, nx=self._nx, ny=self._ny)[np.any(self._optzones, axis=0)])
             new_nx = new_ny = int(rmax*2 + auto_pad_nfwhm*self._fwhm)
             cropped_shape = [new_ny, new_nx]
@@ -562,7 +563,8 @@ class SpaceRDI:
                                   c_star_out=c_derot, 
                                   output_ext=output_ext,
                                   derotated=derotate,
-                                  reduc_label=reduc_label)
+                                  reduc_label=reduc_label,
+                                  store_settings=self.store_settings)
         if save_products:
             if self.save_instance and not forward_model:
                 extra_hdus = [self._to_fits()]
@@ -776,10 +778,17 @@ class SpaceRDI:
         files, repopulating any settings in self.fixed_rdi_settings, and
         reporting the configuration if verbose is True.
         """
-        self.output_ext = output_ext
-        self.rdi_settings = presets
-        self.rdi_settings.update(self.fixed_rdi_settings)
-        self.reduc_label = reduc_label
+        if isinstance(presets, SpaceReduction):
+            if presets.rdi_settings is None:
+                raise ValueError("If set_presets is passed a SpaceReduction object, it must have rdi_settings set.")
+            self.rdi_settings = presets.rdi_settings
+            self.reduc_label = presets.reduc_label
+            self.output_ext = presets.output_ext
+        else:
+            self.output_ext = output_ext
+            self.rdi_settings = presets
+            self.rdi_settings.update(self.fixed_rdi_settings)
+            self.reduc_label = reduc_label
         self._check_smoothed_nans()
         if self.verbose:
             self.report_current_config()
@@ -796,7 +805,7 @@ class SpaceRDI:
         self.set_presets(presets={}, output_ext=output_ext, reduc_label=reduc_label)
     
     
-    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub', reduc_label='HPFRDI (Winnie)'):
+    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, niter=1, output_ext='hpfrdi_psfsub', reduc_label='HPFRDI (Winnie)'):
         """
         Set presets for High-Pass Filtering RDI (HPFRDI), in which coefficients
         are computed by comparing high-pass filtered science and reference
@@ -809,12 +818,14 @@ class SpaceRDI:
             filter_size_adj (float, optional): Adjustment factor for the filter
                 size. Defaults to 1. output_ext (str, optional): Output file
                 extension for FITS products. Defaults to 'hpfrdi_psfsub'.
+            niter (int, optional): Number of iterations of high-pass filtering
+                to apply. Defaults to 1.
         """
         if filter_size is None:
             filter_size = self._sigma
         presets = {}
         presets['opt_smoothing_fn'] = high_pass_filter_sequence
-        presets['opt_smoothing_kwargs'] = dict(filtersize=filter_size_adj*filter_size)
+        presets['opt_smoothing_kwargs'] = dict(filtersize=filter_size_adj*filter_size, niter=niter)
         self.set_presets(presets=presets, output_ext=output_ext, reduc_label=reduc_label)
     
     
@@ -848,6 +859,7 @@ class SpaceRDI:
     def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
                             output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
                             convolver_basedir=None, convolver_subdir='psfgrids', fetch_opd_by_date=True, 
+                            use_distorted_psfs=True,
                             grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                             grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
                             transmission_map_fn=get_jwst_coron_transmission_map,
@@ -950,11 +962,137 @@ class SpaceRDI:
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
-                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving)
+                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving, use_distorted_psfs=use_distorted_psfs)
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
             self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
+
+
+    def rescale_circumstellar_model(self, data_reduc=None, use_err=False, mask=None,
+                                    return_scale=False, return_fm=False, med_filter=False,
+                                    **kwargs):
+        """
+        Compute the least-squares scaling factor between the circumstellar
+        model and the data. This is useful for RDI forward modeling, since models
+        can be rescaled to minimize residuals after forward modeling —
+        effectively reducing the number of parameters that must be fit.
+
+        ___________
+        Parameters:
+
+        data_reduc : SpaceReduction or None
+            Option to pass a pre-generated set of RDI residuals to calculate model scaling.
+            If None, the residuals will be generated on the fly using run_rdi.
+        use_err : bool or ndarray
+            If True, uses the error array from data_reduc for weighted scaling calculation.
+            If an ndarray, uses that array as the error/uncertainty weights.
+            If False, performs unweighted scaling. Default is False.
+        mask : ndarray or None
+            A boolean mask to apply to the data when computing the scaling factor. 
+            True values indicate pixels to include during the scaling calculation.
+            If None, no mask is applied.
+        return_scale : bool
+            If True, returns the scaling factor applied to the circumstellar disk model.
+        return_fm : bool
+            If True, also returns the scaled forward model SpaceReduction object.
+        med_filter : bool
+            If True, applies a median filter to both the data and forward model before
+            computing the scaling factor. Default is False.
+        **kwargs : dict
+            Additional keyword arguments passed to run_rdi when generating residuals.
+        
+        ___________
+        Returns:
+        
+        If return_scale and return_fm are both False, returns None (model is scaled in place).
+        If return_scale is True, returns the scaling factor (float).
+        If return_fm is True, returns the scaled forward model (SpaceReduction).
+        If both are True, returns (sfac, fm_reduc) tuple.
+        """
+        from .utils import median_filter_sequence, model_rescale_factor
+        from copy import copy, deepcopy
+
+        if self.imcube_css is None:
+            raise ValueError(
+                """
+                Prior to executing circumstellar_model_rescale, you must first
+                set a circumstellar model using set_circumstellar_model.
+                """)
+
+        # Save current presets
+        output_ext_prev = deepcopy(self.output_ext)
+        presets_prev = copy(self.rdi_settings)
+        reduc_label_prev = copy(self.reduc_label)
+        cropped_shape_prev = copy(self.cropped_shape)
+
+        # Run RDI if necessary
+        if data_reduc is None:
+            data_reduc = self.run_rdi(**kwargs)
+        else:
+            if data_reduc.rdi_settings != self.rdi_settings:
+                self.set_presets(data_reduc)
+            if data_reduc.ny != self.ny or data_reduc.nx != self.nx:
+                self.set_crop([data_reduc.ny, data_reduc.nx])
+
+        # Foward model circumstellar disk model
+        fm_reduc = self.run_rdi(forward_model=True, **kwargs)
+
+        # Use the roll arrays if the image array wasn't computed 
+        # (e.g., reduced with derotate=False)
+        if fm_reduc.im is None:
+            arr_data = data_reduc.rolls
+            arr_fm = fm_reduc.rolls
+            if isinstance(use_err, bool):
+                if use_err:
+                    arr_sig = data_reduc.err_rolls
+                else:
+                    arr_sig = None
+            else:
+                arr_sig = use_err
+        else:
+            arr_data = data_reduc.im
+            arr_fm = fm_reduc.im
+            if isinstance(use_err, bool):
+                if use_err:
+                    arr_sig = data_reduc.err
+                else:
+                    arr_sig = None
+            else:
+                arr_sig = use_err
+            
+        # Compute the scaling factor
+        if med_filter:
+            footprint = np.array([[0,1,0], 
+                                  [1,1,1], 
+                                  [0,1,0]])
+            args = median_filter_sequence(np.array([arr_data, arr_fm]),
+                                          footprint=footprint, 
+                                          prop_threshold=0.8)
+        else:
+            args = (arr_data, arr_fm)
+
+        sfac = model_rescale_factor(*args, sig=arr_sig, mask=mask)
+
+        # Scale the model
+        self._imcube_css *= sfac
+        if return_fm:
+            if fm_reduc.im is not None:
+                fm_reduc.im *= sfac
+            if fm_reduc.rolls is not None:
+                fm_reduc.rolls *= sfac
+
+        if self.rdi_settings != presets_prev:
+            self.set_presets(presets=presets_prev, output_ext=output_ext_prev, reduc_label=reduc_label_prev)
+        if np.any(cropped_shape_prev != self.cropped_shape):
+            self.set_crop(cropped_shape_prev)
+
+        if return_scale and return_fm:
+            return sfac, fm_reduc
+        elif return_scale:
+            return sfac
+        elif return_fm:
+            return fm_reduc
 
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',
@@ -1102,7 +1240,8 @@ class SpaceRDI:
             im_rolls = None
         
         products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
-                                  c_star_out=c_derot, output_ext=output_ext)
+                                  c_star_out=c_derot, output_ext=output_ext,
+                                  store_settings=False)
         
         if save_products:
             try:
@@ -1150,6 +1289,13 @@ class SpaceRDI:
                 if self.pad_data is not None:
                     coron_tmap = np.pad(coron_tmap, self._imc_padding[1:], constant_values=np.nan)
                 coron_tmaps[i] = coron_tmap
+                # To do: figure out how to get image_manip.crop_image to work with
+                # non-geometrically centered arrays.
+                # ny, nx = coron_tmaps.shape[-2:]
+                # coron_tmaps[i] = image_manip.crop_image(fits.getdata(maskfiles[i]),
+                #                                         (ny,nx),
+                #                                         xyloc=self.c_star-[self._imc_padding[2][0], self._imc_padding[1][0]],
+                #                                         fill_val=np.nan)
         if self.pad_before_derot:
             coron_tmaps_derot, c_derot = pad_and_rotate_hypercube(coron_tmaps, -self._posangs_sci,
                                                           cent=self.c_star, ncores=self.ncores, 
@@ -1174,7 +1320,7 @@ class SpaceRDI:
             im_rolls = None
 
         products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
-                                  c_star_out=c_derot, output_ext='psfmask')
+                                  c_star_out=c_derot, output_ext='psfmask', store_settings=False)
 
         products.filename = products.filename.replace('psfmask_i2d.fits', 'psfmask.fits')
 
@@ -1192,7 +1338,7 @@ class SpaceRDI:
         if model_reduc is None:
             model_reduc = self.run_rdi(save_products=False, forward_model=True)
         output_ext = f'{data_reduc.output_ext}_{output_suffix}'
-        products = SpaceReduction(spacerdi=self, im=data_reduc.im-model_reduc.im, rolls=data_reduc.rolls-model_reduc.rolls, c_star_out=data_reduc.c_star, output_ext=output_ext, reduc_label=reduc_label)
+        products = SpaceReduction(spacerdi=self, im=data_reduc.im-model_reduc.im, rolls=data_reduc.rolls-model_reduc.rolls, c_star_out=data_reduc.c_star, output_ext=output_ext, reduc_label=reduc_label, store_settings=self.store_settings)
         if save_products:
             try:
                 products.save(overwrite=self.overwrite)
@@ -1344,7 +1490,8 @@ class SpaceRDI:
 
 
     def run_deconvolution(self, reduc_in=None, num_iter=500, epsilon='auto', auto_eps_errtol=1e-3, return_iters=None,
-                          init_from_reduc=False, excl_mask_in=None, psf_crop_pixels=None, output_suffix='deconv', save_products=False, show_progress=True):
+                          init_from_reduc=False, excl_mask_in=None, psf_crop_pixels=None, output_suffix='deconv',
+                          save_products=False, show_progress=True, deconv_kws={}):
         """
         Perform deconvolution using a variant of the Richardson Lucy algorithm,
         adapted for shift-variant coronagraphic observations. Requires that
@@ -1468,9 +1615,9 @@ class SpaceRDI:
 
         if epsilon == 'auto':
             if reduc.err_rolls is None:
-                epsilon = auto_eps_errtol*np.nanmedian(reduc.err_rolls)
-            else:
                 epsilon = auto_eps_errtol*nan_median_absolute_deviation(reduc.rolls)
+            else:
+                epsilon = auto_eps_errtol*np.nanmedian(reduc.err_rolls)
 
         rolls_deconv = np.zeros_like(reduc.rolls)
         if return_iters is not None:
@@ -1496,7 +1643,7 @@ class SpaceRDI:
 
             out = coronagraphic_richardson_lucy(image_in, deconv_psfs[i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i], num_iter=num_iter,
                                                 im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters, use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask,
-                                                show_progress=show_progress)
+                                                show_progress=show_progress, **deconv_kws)
             if return_iters is None:
                 rolls_deconv[i] = np.where(excl_mask_in, image, out)
                 rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
@@ -1505,7 +1652,7 @@ class SpaceRDI:
                 rolls_deconv[i], deconv_iters[:,i] = np.where(init_nans, np.nan, rolls_deconv[i]), np.where(init_nans, np.nan, deconv_iters[:,i])
 
         im_deconv = np.nanmedian(rolls_deconv, axis=0)
-        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv, c_star_out=reduc.c_star, output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)
+        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv, c_star_out=reduc.c_star, output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label, store_settings=False)
         if save_products:
             try:
                 products.save(overwrite=self.overwrite)
@@ -1625,8 +1772,9 @@ class SpaceConvolution:
                  overwrite=True, fetch_opd_by_date=True,
                  pad_data='auto', output_basedir=None,
                  output_subdir='psfgrids',
-                 efficient_saving=True):
-        
+                 efficient_saving=True,
+                 use_distorted_psfs=True):
+
         self.database = database
         self.source_spectrum = source_spectrum
         self.ncores = ncores
@@ -1642,6 +1790,7 @@ class SpaceConvolution:
         self.fetch_opd_by_date = fetch_opd_by_date
         self.pad_data = pad_data
         self.efficient_saving = efficient_saving
+        self.use_distorted_psfs = use_distorted_psfs
         self.output_basedir = self.database.output_dir if output_basedir is None else output_basedir
         self.output_dir = f'{output_basedir}{output_subdir}/'
         if not os.path.isdir(self.output_basedir):
@@ -1754,10 +1903,21 @@ class SpaceConvolution:
                 pupil_shift_y = -0.0022,
                 pupil_rotation = -0.38)
         elif self.image_mask == 'MASK335R':
-            stpsf_options = dict(
-                pupil_shift_x = -0.0125,
-                pupil_shift_y = -0.008,
-                pupil_rotation = -0.595)
+            if self.channel == 'LONG':
+                stpsf_options = dict(
+                    pupil_shift_x = -0.01346839,
+                    pupil_shift_y = -0.00762122,
+                    pupil_rotation = -0.56725767)
+                if self.filt == 'F444W':
+                    stpsf_options['defocus_waves'] = -0.00162708
+            else: # SHORT channel
+                stpsf_options = dict(
+                    pupil_shift_x = 0.00898595,
+                    pupil_shift_y = 0.00132024,
+                    pupil_rotation = -0.08309628)
+                if self.filt == 'F200W':
+                    stpsf_options['defocus_waves'] = -0.00883023
+
         elif self.image_mask == 'FQPM1140':
             stpsf_options = dict(
                 pupil_shift_x = 0.00957944,
@@ -1774,7 +1934,13 @@ class SpaceConvolution:
 
         self.prepare_webbpsf_ext_instance(options=stpsf_options)
 
-        self.psf_file = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
+        self._psf_file_dist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
+        self._psf_file_nodist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}_nodist.fits'
+
+        if self.use_distorted_psfs:
+            self.psf_file = self._psf_file_dist
+        else:
+            self.psf_file = self._psf_file_nodist
 
         self._psf_shift = None
         self._coron_tmaps_osamp = None
@@ -1976,11 +2142,21 @@ class SpaceConvolution:
                             shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
                             show_progress=self.show_progress, **self.grid_kwargs)
                 
-                self.psfs, self.psf_offsets_polar, self.psf_offsets = out
-                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(self.psfs), 
+                psfs_dist, psfs_nodist, self.psf_offsets_polar, self.psf_offsets = out
+                if self.use_distorted_psfs:
+                    self.psfs = psfs_dist
+                else:
+                    self.psfs = psfs_nodist
+
+                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(psfs_dist), 
                                           fits.ImageHDU(self.psf_offsets_polar),
                                           fits.ImageHDU(self.psf_offsets)])
-                hdul.writeto(self.psf_file, overwrite=True)
+                hdul.writeto(self._psf_file_dist, overwrite=True)
+
+                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(psfs_nodist), 
+                                          fits.ImageHDU(self.psf_offsets_polar),
+                                          fits.ImageHDU(self.psf_offsets)])
+                hdul.writeto(self._psf_file_nodist, overwrite=True)
             else:
                 self.psfs, self.psf_offsets_polar, self.psf_offsets = None, None, None
             
@@ -2062,7 +2238,7 @@ class SpaceConvolution:
         self.set_crop(self.cropped_shape)
 
 
-    def convolve_model(self, model, pxscale_in, c_star_in=None):
+    def convolve_model(self, model, pxscale_in, c_star_in=None, return_raw=False):
         if c_star_in is None:
             ny_in, nx_in = model.shape
             c_star_in = (np.array([nx_in, ny_in])-1.)/2.
@@ -2084,10 +2260,12 @@ class SpaceConvolution:
         if sfac != 1:
             model_osamp = webbpsf_ext.image_manip.frebin(model_cr, scale=sfac, total=False)
         else:
-            model_osamp = model.copy()
+            model_osamp = model_cr.copy()
             
         c_star_in_cr_osamp = c_to_c_osamp(c_star_in_cr, sfac)
         model_con_out = np.zeros((len(self.posangs_sci), self.ny, self.nx))
+        if return_raw:
+            model_raw_out = np.zeros((len(self.posangs_sci), self.ny, self.nx))
         for i,posang in enumerate(self.posangs_sci):
             model_rot = rotate_image(model_osamp, posang, cent=c_star_in_cr_osamp, use_gpu=self.use_gpu, cval0=0)
             model_rot = pad_or_crop_image(model_rot, shape_osamp, cent=c_star_in_cr_osamp, new_cent=c_star_osamp, cval0=0.)
@@ -2097,7 +2275,10 @@ class SpaceConvolution:
                                                 use_gpu=self.use_gpu, ncores=self.ncores)
 
             model_con_out[i] = webbpsf_ext.image_manip.frebin(model_con, scale=1/self.osamp, total=False)
-
+            if return_raw:
+                model_raw_out[i] = webbpsf_ext.image_manip.frebin(model_rot, scale=1/self.osamp, total=False)
+        if return_raw:
+            return model_con_out, model_raw_out
         return model_con_out
 
 
@@ -2128,7 +2309,7 @@ class SpaceConvolution:
 
 class SpaceReduction:
     def __init__(self, file_to_load=None, spacerdi=None, output_ext=None, im=None, rolls=None, err=None,
-                 err_rolls=None, c_star_out=None, concat=None, derotated=True, reduc_label=''):
+                 err_rolls=None, c_star_out=None, concat=None, derotated=True, reduc_label='', store_settings=True):
         """
         Generates a new set of reduction products or load one that was previously saved.
         
@@ -2152,6 +2333,11 @@ class SpaceReduction:
                 self.ny, self.nx = self.im.shape
             else:
                 self.ny, self.nx = self.rolls.shape[1:]
+
+            if store_settings:
+                self.rdi_settings = deepcopy(spacerdi.rdi_settings)
+            else:
+                self.rdi_settings = None
 
             image_headers = []
             c_coron_out = []
@@ -2181,6 +2367,7 @@ class SpaceReduction:
                                                    ['axis 1 coordinate of the coron center',
                                                     'axis 2 coordinate of the coron center'])
                 
+                h1['MASKCENX'], h1['MASKCENY'] = h1['CCORON1'], h1['CCORON2']
                 h1['STARCENX'], h1['STARCENY'] = h1['CRPIX1'], h1['CRPIX2']
                 image_headers.append(h1)
                 if i == uni_visit_inds[0]:
@@ -2248,11 +2435,10 @@ class SpaceReduction:
                                                                 
                     if concat_str not in file_to_load: # For backwards compatability
                         concat_str = 'JWST_{}_{}_{}_{}_{}'.format(h0['INSTRUME'], 
-                                                                h0['DETECTOR'],
-                                                                h0['FILTER'],
-                                                                h0.get('CORONMSK', 'NONE'),
-                                                                h0['SUBARRAY']
-                                                                )
+                                                                  h0['DETECTOR'],
+                                                                  h0['FILTER'],
+                                                                  h0.get('CORONMSK', 'NONE'),
+                                                                  h0['SUBARRAY'])
 
             self.filename = file_to_load
             hdul = fits.open(file_to_load)
@@ -2295,6 +2481,14 @@ class SpaceReduction:
             else:
                 self.ny, self.nx = self.rolls.shape[1:]
 
+
+            if store_settings:
+                if 'rdi_settings' in hdul:
+                    p_in = hdul['rdi_settings'].data.astype('int64').tolist()
+                    self.rdi_settings = (pickle.loads(bytes(p_in)))
+                else:
+                    self.rdi_settings = None
+
             hdul.close()
         self.extent = mpl_centered_extent([self.ny, self.nx], self.c_star, self.pxscale)
     
@@ -2323,6 +2517,8 @@ class SpaceReduction:
             for i,h1 in enumerate(copy(self.image_headers)):
                 hdul.append(fits.ImageHDU(data=None, header=h1, name=f'SCI_ROLL{i+1}'))
         
+        if self.rdi_settings is not None:
+            hdul.append(fits.ImageHDU(list(pickle.dumps(self.rdi_settings, pickle.HIGHEST_PROTOCOL)), name='rdi_settings'))
         return hdul
 
 

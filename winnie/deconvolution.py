@@ -1,12 +1,10 @@
 from tqdm.auto import tqdm
-from copy import copy, deepcopy
-from winnie.convolution import (convolve_with_spatial_psfs, psf_convolve_cpu, psf_convolve_gpu)
-from winnie.utils import crop_data
+from .convolution import (convolve_with_spatial_psfs, psf_convolve_cpu, psf_convolve_gpu)
 import numpy as np
 
 def coronagraphic_richardson_lucy(image, psfs, psf_inds=None, im_mask=None, num_iter=500, im_deconv_in=None,
                                   epsilon=0, return_iters=None, use_gpu=False, ncores=-2, show_progress=True,
-                                  excl_mask=None):
+                                  excl_mask=None, mirror_psfs=False):
     float_type = image.dtype
 
     if im_deconv_in is None:
@@ -24,7 +22,11 @@ def coronagraphic_richardson_lucy(image, psfs, psf_inds=None, im_mask=None, num_
     if im_mask is None:
         im_mask = 1.
 
-    psfs_inv = np.flip(psfs, axis=(-1,-2))
+    if mirror_psfs:
+        psfs_inv = np.flip(psfs, axis=(-1,-2))
+    else:
+        psfs_inv = psfs
+
     unity_conv = convolution_fn(np.ones_like(image), psfs_inv, **conv_kwargs) # Correction for shift-variant PSFs
     
     if return_iters is not None:

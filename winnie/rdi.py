@@ -9,7 +9,8 @@ from .utils import (dist_to_pt, rotate_hypercube, pad_and_rotate_hypercube, free
 
 def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask=None, show_progress=False, posangs=None, cent=None, 
                   objective=False, zero_nans=False, use_gpu=False, ncores=-2, return_coeffs=False, coeffs_in=None, return_psf_model=False,
-                  pad_before_derot=False, opt_smoothing_fn=None, opt_smoothing_kwargs={}, err_hcube=None, err_hcube_ref=None, large_arrs=False):
+                  pad_before_derot=False, opt_smoothing_fn=None, opt_smoothing_kwargs={}, err_hcube=None, err_hcube_ref=None, large_arrs=False,
+                  hcube_ref_opt=None):
     """
     Performs RDI PSF subtraction using LOCI (Lafreniere et al. 2007). Using available keyword arguments, this function can be used to 
     perform:
@@ -136,9 +137,13 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
         hcube_sub = hcube - hcube_css
         
     if opt_smoothing_fn is not None:
-        hcube_opt, hcube_ref_opt = opt_smoothing_fn(hcube_sub, **opt_smoothing_kwargs), opt_smoothing_fn(hcube_ref, **opt_smoothing_kwargs)
+        hcube_opt = opt_smoothing_fn(hcube_sub, **opt_smoothing_kwargs)
+        if hcube_ref_opt is None:
+            hcube_ref_opt = opt_smoothing_fn(hcube_ref, **opt_smoothing_kwargs)
     else:
-        hcube_opt, hcube_ref_opt = hcube_sub, hcube_ref
+        hcube_opt = hcube_sub
+        if hcube_ref_opt is None:
+            hcube_ref_opt = hcube_ref
 
     if zero_nans: 
         hcube_opt = np.nan_to_num(hcube_opt)

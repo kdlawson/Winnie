@@ -190,9 +190,12 @@ def gaussian_filter_sequence(im, sigma, prop_threshold=1e-6):
     return im_out
 
 
-def high_pass_filter_sequence(im, filtersize, prop_threshold=1e-6):
+def high_pass_filter_sequence(im, filtersize, prop_threshold=1e-6, niter=1):
     im = np.asarray(im)
-    return im-gaussian_filter_sequence(im, filtersize, prop_threshold=prop_threshold)
+    im_out = im.copy()
+    for _ in range(niter):
+        im_out -= gaussian_filter_sequence(im_out, filtersize, prop_threshold=prop_threshold)
+    return im_out
 
 
 def median_filter_sequence(im, radius=None, size=None, footprint=None, prop_threshold=1e-6):
@@ -216,6 +219,7 @@ def median_filter_sequence(im, radius=None, size=None, footprint=None, prop_thre
             im_out[i] = propagate_nans_in_spatial_operation(im_reshaped[i], ndimage.median_filter, fn_args=fn_args, fn_kwargs=fn_kwargs, prop_threshold=prop_threshold)
         im_out = im_out.reshape(im.shape)
     return im_out
+
 
 def pad_or_crop_image(im, new_size, cent=None, new_cent=None, cval0=np.nan, nan_prop_threshold=0., zero_prop_threshold=0., prefilter=True, order=3):
     new_size = np.asarray(new_size)
