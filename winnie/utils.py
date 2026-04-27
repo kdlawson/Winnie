@@ -334,10 +334,10 @@ def rotate_image_cpu(im, angle, cent=None, new_cent=None, cval0=np.nan, prefilte
         else:
             rot_im = ndimage.rotate(im, angle, axes=(-2, -1), reshape=False, cval=cval0, prefilter=prefilter)
         if any_zeros:
-            rot_zeros = ndimage.rotate(zeros.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False)
-            rot_im = np.where(rot_zeros>0., 0., rot_im)
+            rot_zeros = ndimage.rotate(zeros.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False, order=1)
+            rot_im = np.where(rot_zeros>0.5, 0., rot_im)
         if any_nans:
-            rot_nans = ndimage.rotate(nans.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False)
+            rot_nans = ndimage.rotate(nans.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False, order=1)
             rot_im = np.where(rot_nans>0., np.nan, rot_im)
     else:
         if any_nans:
@@ -345,10 +345,10 @@ def rotate_image_cpu(im, angle, cent=None, new_cent=None, cval0=np.nan, prefilte
         else:
             rot_im = rotate_about_pos(im, cent, angle, new_cent=new_cent, cval=cval0, prefilter=prefilter)
         if any_zeros:
-            rot_zeros = rotate_about_pos(zeros.astype(float), cent, angle, new_cent=new_cent, prefilter=False)
-            rot_im = np.where(rot_zeros>0., 0., rot_im)
+            rot_zeros = rotate_about_pos(zeros.astype(float), cent, angle, new_cent=new_cent, prefilter=False, order=1)
+            rot_im = np.where(rot_zeros>0.5, 0., rot_im)
         if any_nans:
-            rot_nans = rotate_about_pos(nans.astype(float), cent, angle, new_cent=new_cent, prefilter=False)
+            rot_nans = rotate_about_pos(nans.astype(float), cent, angle, new_cent=new_cent, prefilter=False, order=1)
             rot_im = np.where(rot_nans>0., np.nan, rot_im)
     return rot_im
 
@@ -372,10 +372,10 @@ def rotate_image_gpu(im0, angle, cent=None, cval0=np.nan, prefilter=True):
         else:
             rot_im = cp_ndimage.rotate(im, angle, axes=(-2, -1), reshape=False, cval=cval0, prefilter=prefilter)
         if any_zeros:
-            rot_zeros = cp_ndimage.rotate(zeros.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False)
-            rot_im = cp.where(rot_zeros>0., 0., rot_im)
+            rot_zeros = cp_ndimage.rotate(zeros.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False, order=1)
+            rot_im = cp.where(rot_zeros>0.5, 0., rot_im)
         if any_nans:
-            rot_nans = cp_ndimage.rotate(nans.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False)
+            rot_nans = cp_ndimage.rotate(nans.astype(float), angle, axes=(-2, -1),  prefilter=False, reshape=False, order=1)
             rot_im = cp.where(rot_nans>0., cp.nan, rot_im)
     else:
         if any_nans:
@@ -383,13 +383,12 @@ def rotate_image_gpu(im0, angle, cent=None, cval0=np.nan, prefilter=True):
         else:
             rot_im = rotate_about_pos_gpu(im, cent, angle, cval=cval0, prefilter=prefilter)
         if any_zeros:
-            rot_zeros = rotate_about_pos_gpu(zeros.astype(float), cent, angle,  prefilter=False)
-            rot_im = cp.where(rot_zeros>0., 0., rot_im)
+            rot_zeros = rotate_about_pos_gpu(zeros.astype(float), cent, angle,  prefilter=False, order=1)
+            rot_im = cp.where(rot_zeros>0.5, 0., rot_im)
         if any_nans:
-            rot_nans = rotate_about_pos_gpu(nans.astype(float), cent, angle,  prefilter=False)
+            rot_nans = rotate_about_pos_gpu(nans.astype(float), cent, angle,  prefilter=False, order=1)
             rot_im = cp.where(rot_nans>0., cp.nan, rot_im)
     return cp.asnumpy(rot_im)
-
 
 def rotate_about_pos(im, pos, angle, new_cent=None, cval=np.nan, order=3, mode='constant', prefilter=True):
     ny, nx = im.shape[-2:]

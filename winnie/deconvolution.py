@@ -6,7 +6,8 @@ import numpy as np
 
 def coronagraphic_richardson_lucy(image, psfs, psf_inds=None, im_mask=None, num_iter=500, im_deconv_in=None,
                                   epsilon=0, return_iters=None, use_gpu=False, ncores=-2, show_progress=True,
-                                  excl_mask=None):
+                                  excl_mask=None, mirror_psfs=False, convolution_method='auto', 
+                                  conv_patch_bounds=None, conv_used_inds=None):
     float_type = image.dtype
 
     if im_deconv_in is None:
@@ -19,12 +20,18 @@ def coronagraphic_richardson_lucy(image, psfs, psf_inds=None, im_mask=None, num_
         conv_kwargs = {}
     else:
         convolution_fn = convolve_with_spatial_psfs
-        conv_kwargs = {'psf_inds':psf_inds, 'use_gpu':use_gpu, 'ncores':ncores}
+        conv_kwargs = {'psf_inds':psf_inds, 'use_gpu':use_gpu, 'ncores':ncores,
+                       'method':convolution_method, 'patch_bounds':conv_patch_bounds,
+                       'used_inds':conv_used_inds}
 
     if im_mask is None:
         im_mask = 1.
 
-    psfs_inv = np.flip(psfs, axis=(-1,-2))
+    if mirror_psfs:
+        psfs_inv = np.flip(psfs, axis=(-1,-2))
+    else:
+        psfs_inv = psfs
+
     unity_conv = convolution_fn(np.ones_like(image), psfs_inv, **conv_kwargs) # Correction for shift-variant PSFs
     
     if return_iters is not None:

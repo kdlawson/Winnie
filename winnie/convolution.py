@@ -10,7 +10,81 @@ from copy import deepcopy
 from tqdm.auto import tqdm
 
 
-def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=False, ncores=-2):
+_AUTO_CONVOLUTION_MARGIN = 0.9
+
+
+def _get_psf_patch_bounds(psf_inds, n_psfs, psf_hws):
+    """
+    Compute padded bounding boxes for each PSF index present in ``psf_inds``.
+    
+    Parameters
+    ----------
+    psf_inds : ndarray
+        2D array of PSF indices.
+    n_psfs : int
+        Number of PSFs.
+    psf_hws : tuple
+        (psf_height_half_width, psf_width_half_width).
+    
+    Returns
+    -------
+    used_inds : ndarray
+        Indices of PSFs present in ``psf_inds``.
+    bounds : ndarray
+        Padded bounding boxes as (y1, y2, x1, x2) for each PSF index.
+    """
+    ny, nx = psf_inds.shape
+    flat_inds = np.ravel(psf_inds)
+    counts = np.bincount(flat_inds, minlength=n_psfs)
+    used_inds = np.flatnonzero(counts)
+
+    y_coords, x_coords = [i.ravel() for i in np.indices((ny,nx), dtype=np.int32)]
+
+    min_y = np.full(n_psfs, ny, dtype=np.int32)
+    min_x = np.full(n_psfs, nx, dtype=np.int32)
+    max_y = np.full(n_psfs, -1, dtype=np.int32)
+    max_x = np.full(n_psfs, -1, dtype=np.int32)
+
+    np.minimum.at(min_y, flat_inds, y_coords)
+    np.minimum.at(min_x, flat_inds, x_coords)
+    np.maximum.at(max_y, flat_inds, y_coords)
+    np.maximum.at(max_x, flat_inds, x_coords)
+
+    psf_yhw, psf_xhw = psf_hws
+    bounds = np.column_stack((
+        np.maximum(min_y[used_inds] - psf_yhw, 0),
+        np.minimum(max_y[used_inds] + psf_yhw, ny - 1),
+        np.maximum(min_x[used_inds] - psf_xhw, 0),
+        np.minimum(max_x[used_inds] + psf_xhw, nx - 1),
+    ))
+    return used_inds, bounds
+
+
+def _estimate_fft_convolution_cost(im_shapes, psf_shape):
+    """
+    Estimate relative FFT convolution work for one or more image shapes.
+    """
+    im_shapes = np.atleast_2d(np.asarray(im_shapes, dtype=np.float64))
+    conv_sizes = np.prod(im_shapes + np.asarray(psf_shape, dtype=np.float64) - 1, axis=1)
+    return conv_sizes * np.log2(np.maximum(conv_sizes, 2.0))
+
+
+def _choose_spatial_psf_convolution_strategy(im_shape, psf_shape, patch_bounds, return_costs=False):
+    """
+    Choose between full-frame and localized convolution based on FFT work.
+    """
+    if len(patch_bounds) == 0:
+        return 'localized'
+
+    full_cost = len(patch_bounds) * _estimate_fft_convolution_cost(im_shape, psf_shape)[0]
+    patch_shapes = patch_bounds[:, [1, 3]] - patch_bounds[:, [0, 2]] + 1
+    localized_cost = _estimate_fft_convolution_cost(patch_shapes, psf_shape).sum()
+    if return_costs:
+        return full_cost, localized_cost
+    return 'localized' if localized_cost < (full_cost * _AUTO_CONVOLUTION_MARGIN) else 'full'
+
+
+def convolve_with_spatial_psfs(im_in, psfs, psf_inds, patch_bounds=None, used_inds=None, coron_tmap=None, use_gpu=False, ncores=-2, method='auto'):
     """
     Creates a PSF-convolved image where each pixel of the input image has been
     convolved with the nearest spatially-sampled PSF. 
@@ -30,6 +104,15 @@ def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=F
             index of the slice in psfs with which that pixel in im_in should be
             convolved.
 
+        patch_bounds: ndarray, optional
+            Pre-computed padded bounding boxes for each PSF index in psf_inds,
+            as returned by _get_psf_patch_bounds. If not provided, will be
+            computed on the fly if method is 'auto' or 'localized'.
+
+        used_inds: ndarray, optional
+            Pre-computed array of PSF indices present in psf_inds. If not
+            provided, will be computed on the fly.
+            
         coron_tmap: ndarray, optional
             2D array of coronagraph transmission (same shape as im_in), by
             which im_in will be multiplied before convolution.
@@ -39,6 +122,12 @@ def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=F
             
         ncores: int, optional
             The number of CPU cores to use (when use_gpu=False) for convolution
+
+        method: {'auto', 'localized', 'full'}, optional
+            Convolution strategy to use. 'localized' uses padded bounding
+            boxes around each PSF region, 'full' uses the full science
+            frame for every PSF index, and 'auto' selects between them
+            using an FFT work estimate.
             
     Returns:
         imcon: ndarray
@@ -50,27 +139,54 @@ def convolve_with_spatial_psfs(im_in, psfs, psf_inds, coron_tmap=None, use_gpu=F
         
     convolution_fn = psf_convolve_gpu if use_gpu else psf_convolve_cpu
     
-    yi,xi = np.indices(im.shape)
-    nonzero = im != 0.
-    
     psf_yhw, psf_xhw = np.ceil(np.array(psfs.shape[-2:])/2.).astype(int)
-    xi_nz, yi_nz = xi[nonzero], yi[nonzero]
-    x1, x2 = int(max(xi_nz.min()-psf_xhw, 0)), int(min(xi_nz.max()+psf_xhw, im.shape[-1]))
-    y1, y2 = int(max(yi_nz.min()-psf_yhw, 0)), int(min(yi_nz.max()+psf_yhw, im.shape[-2]))
     
-    im_crop = im[y1:y2+1, x1:x2+1]
-    psf_inds_crop = psf_inds[y1:y2+1, x1:x2+1]
-    
-    if use_gpu or ncores==1:
-        imcon_crop = np.zeros(im_crop.shape, dtype=im.dtype)
-        for i in np.unique(psf_inds_crop):
-            im_to_convolve = np.where(psf_inds_crop==i, im_crop, 0.)
-            imcon_crop += convolution_fn(im_to_convolve, psfs[i])
+    method = method.lower()
+    if method not in {'auto', 'localized', 'full'}:
+        raise ValueError("method must be one of 'auto', 'localized', or 'full'")
+
+    if method in {'auto', 'localized'}:
+        if (used_inds is None) or (patch_bounds is None):
+            used_inds, patch_bounds = _get_psf_patch_bounds(psf_inds, psfs.shape[0], (psf_yhw, psf_xhw))
+        if method == 'auto':
+            method = _choose_spatial_psf_convolution_strategy(im.shape, psfs.shape[-2:], patch_bounds)
+
+    if method == 'full':
+        if used_inds is None:
+            used_inds = np.flatnonzero(np.bincount(psf_inds.ravel(), minlength=psfs.shape[0]))
+        if use_gpu or ncores == 1:
+            imcon = np.zeros(im.shape, dtype=im.dtype)
+            for i in used_inds:
+                im_to_convolve = np.where(psf_inds == i, im, 0.)
+                imcon += convolution_fn(im_to_convolve, psfs[i])
+        else:
+            results = Parallel(n_jobs=ncores, prefer='threads')(
+                delayed(convolution_fn)(np.where(psf_inds == i, im, 0.), psfs[i])
+                for i in used_inds
+                )
+            imcon = np.sum(results, axis=0)
+
     else:
-        imcon_crop = np.sum(Parallel(n_jobs=ncores, prefer='threads')(delayed(convolution_fn)(np.where(psf_inds_crop==i, im_crop, 0.), psfs[i]) for i in np.unique(psf_inds_crop)), axis=0)
+        def _process_patch(i, bounds):
+            y1_p, y2_p, x1_p, x2_p = bounds
+            patch = im[y1_p:y2_p+1, x1_p:x2_p+1]
+            mask_patch = psf_inds[y1_p:y2_p+1, x1_p:x2_p+1] == i
+            patch_to_convolve = np.where(mask_patch, patch, 0.)
+            patch_convolved = convolution_fn(patch_to_convolve, psfs[i])
+            return patch_convolved
         
-    imcon = np.zeros_like(im)
-    imcon[y1:y2+1, x1:x2+1] = imcon_crop
+        imcon = np.zeros(im.shape, dtype=im.dtype)
+        if use_gpu or ncores == 1:
+            for i, bounds in zip(used_inds, patch_bounds):
+                y1_p, y2_p, x1_p, x2_p = bounds
+                imcon[y1_p:y2_p+1, x1_p:x2_p+1] += _process_patch(i, bounds)
+        else:
+            results = Parallel(n_jobs=ncores, prefer='threads')(
+                delayed(_process_patch)(i, bounds) for i, bounds in zip(used_inds, patch_bounds)
+                )
+            for patch_convolved, (y1_p, y2_p, x1_p, x2_p) in zip(results, patch_bounds):
+                imcon[y1_p:y2_p+1, x1_p:x2_p+1] += patch_convolved
+        
     return imcon
 
 

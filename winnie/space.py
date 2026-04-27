@@ -26,7 +26,9 @@ from .utils import (robust_mean_combine, median_combine,
                     c_to_c_osamp, pad_or_crop_image, dist_to_pt, compute_derot_padding, 
                     nan_median_absolute_deviation)
 
-from .convolution import (convolve_with_spatial_psfs,
+from .convolution import (_AUTO_CONVOLUTION_MARGIN, _choose_spatial_psf_convolution_strategy, 
+                          _get_psf_patch_bounds,
+                          convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
                           get_jwst_coron_transmission_map,
                           generate_lyot_psf_grid,
@@ -847,6 +849,7 @@ class SpaceRDI:
 
     def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
                             output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
+                            convolution_method='auto',
                             convolver_basedir=None, convolver_subdir='psfgrids', fetch_opd_by_date=True, 
                             grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                             grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
@@ -866,8 +869,8 @@ class SpaceRDI:
             The source spectrum to use for generating PSFs for convolution.
         reference_index : int, optional
             The index of the science exposure that will be used to initialize
-            the STPSF instrument object with STPSF's
-            setup_sim_to_match_file function.
+            the STPSF instrument object with STPSF's setup_sim_to_match_file
+            function.
         fov_pixels : int, optional
             The number of pixels in the field of view. Default is 151.
         osamp : int, optional
@@ -880,6 +883,18 @@ class SpaceRDI:
         recalc_psf_grid : bool, optional
             Whether to recalculate the PSF grid if it has already been
             generated and saved. Default is False.
+        convolution_method : {'auto', 'localized', 'full'}, optional
+            The spatial PSF convolution method to be used. If 'full',
+            convolution for each PSF sample is applied to a copy of the model
+            image where all pixels outside of the sample region are set to
+            zero. If 'localized', the model image is also cropped to a padded
+            bounding box around each sample region before convolution. The
+            latter can produce a significant speed-up (e.g., when the image
+            size is much larger than the PSF size), but can also be slower due
+            to added overheads. If 'auto', the method ('localized' or 'full')
+            will be chosen each time an image is convolved to approximately
+            minimize computation time (based on the dimensions of the model
+            image and the PSF grid). Default is 'auto'.
         psfgrids_output_dir : str, optional
             The directory for saving the PSF grids (relative to the output
             direction for the initial SpaceKLIP database). Default is
@@ -903,17 +918,16 @@ class SpaceRDI:
         transmission_map_kwargs : dict, optional
             Additional keyword arguments to be passed to transmission_map_fn.
 
-        Notes:
-        - grid_fn should return three objects: 1) a 3D array of PSF samples, 2)
+        Notes: - grid_fn should return three objects: 1) a 3D array of PSF
+        samples, 2)
           the 2D array of shape (2,N) containing the polar coordinates of those
           samples (relative to the coronagraph center; units of [arcsec,
           degrees]), and 3) the 2D array of shape (2,N) containing the
           cartesian coordinates of those samples (relative to the coronagraph
-          center; units of [arcsec, arcsec]). It should take a STPSF
-          instrument object as the first argument, and must have the following
-          signature: 
-                grid_fn(inst_stpsf, source_spectrum=None, shift=None,
-                osamp=2, fov_pixels=151, show_progress=True, **grid_kwargs)
+          center; units of [arcsec, arcsec]). It should take a STPSF instrument
+          object as the first argument, and must have the following signature: 
+                grid_fn(inst_stpsf, source_spectrum=None, shift=None, osamp=2,
+                fov_pixels=151, show_progress=True, **grid_kwargs)
           See winnie.convolution.generate_lyot_psf_grid for documentation
           regarding these arguments.
 
@@ -936,8 +950,8 @@ class SpaceRDI:
 
         - If even more customization is needed: set prefetch_psf_grid to False
           here and use the set_custom_grid method for the convolver (accessed
-          via the convolver attribute for the SpaceRDI object) to directly
-          set the PSF grid and related objects.
+          via the convolver attribute for the SpaceRDI object) to directly set
+          the PSF grid and related objects.
         """
         convolver_args = dict(reference_index=reference_index, fov_pixels=fov_pixels, osamp=osamp, output_ext=output_ext,
                               prefetch_psf_grid=prefetch_psf_grid, recalc_psf_grid=recalc_psf_grid, grid_fn=grid_fn, grid_kwargs=grid_kwargs,
@@ -950,7 +964,7 @@ class SpaceRDI:
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
-                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving)
+                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving, convolution_method=convolution_method)
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
@@ -1344,7 +1358,8 @@ class SpaceRDI:
 
 
     def run_deconvolution(self, reduc_in=None, num_iter=500, epsilon='auto', auto_eps_errtol=1e-3, return_iters=None,
-                          init_from_reduc=False, excl_mask_in=None, psf_crop_pixels=None, output_suffix='deconv', save_products=False, show_progress=True):
+                          init_from_reduc=False, excl_mask_in=None, psf_crop_pixels=None, output_suffix='deconv',
+                          save_products=False, show_progress=True, deconv_kws={}, convolution_method=None):
         """
         Perform deconvolution using a variant of the Richardson Lucy algorithm,
         adapted for shift-variant coronagraphic observations. Requires that
@@ -1456,8 +1471,10 @@ class SpaceRDI:
         for i,c_coron in enumerate(self.c_coron_sci):
             deconv_psf_inds[i] = self.convolver.grid_inds_fn(c_coron, self.convolver.psf_offsets_polar, 1, shape=(self.ny, self.nx), 
                                                                 pxscale=self.convolver.pxscale, posang=self._posangs_sci[i], c_star=reduc.c_star)
-
-            deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=False,
+            if self.convolver.transmission_map_fn is None:
+                deconv_coron_tmaps[i] = 1.
+            else:
+                deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=False,
                                                                             osamp=self.convolver.osamp, nd_squares=False, 
                                                                             shape=(self.ny, self.nx), posang=self._posangs_sci[i],
                                                                             c_star=reduc.c_star)
@@ -1466,11 +1483,15 @@ class SpaceRDI:
             cpsf = 0.5*(np.array([*deconv_psfs.shape[-2:]])-1)[::-1]
             deconv_psfs, _ = crop_data(deconv_psfs, cpsf, [psf_crop_pixels, psf_crop_pixels])
 
+        conv_patch_bounds, conv_used_inds = self.convolver._compute_patch_bounds(deconv_psf_inds, deconv_psfs.shape[1:])
+        if convolution_method is None:
+            convolution_method = self.convolver.convolution_method
+
         if epsilon == 'auto':
             if reduc.err_rolls is None:
-                epsilon = auto_eps_errtol*np.nanmedian(reduc.err_rolls)
-            else:
                 epsilon = auto_eps_errtol*nan_median_absolute_deviation(reduc.rolls)
+            else:
+                epsilon = auto_eps_errtol*np.nanmedian(reduc.err_rolls)
 
         rolls_deconv = np.zeros_like(reduc.rolls)
         if return_iters is not None:
@@ -1496,7 +1517,8 @@ class SpaceRDI:
 
             out = coronagraphic_richardson_lucy(image_in, deconv_psfs[i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i], num_iter=num_iter,
                                                 im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters, use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask,
-                                                show_progress=show_progress)
+                                                show_progress=show_progress, convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i], conv_used_inds=conv_used_inds[i], **deconv_kws)
+            
             if return_iters is None:
                 rolls_deconv[i] = np.where(excl_mask_in, image, out)
                 rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
@@ -1619,11 +1641,19 @@ class SpaceRDI:
 
 
 class SpaceConvolution:
-    def __init__(self, database, source_spectrum=None,
-                 ncores=-1, use_gpu=False, verbose=True,
-                 show_plots=False, show_progress=True,
-                 overwrite=True, fetch_opd_by_date=True,
-                 pad_data='auto', output_basedir=None,
+    def __init__(self, 
+                 database, 
+                 source_spectrum=None,
+                 ncores=-1, 
+                 use_gpu=False, 
+                 verbose=True,
+                 show_plots=False, 
+                 show_progress=True,
+                 overwrite=True, 
+                 fetch_opd_by_date=True,
+                 pad_data='auto', 
+                 convolution_method='auto',
+                 output_basedir=None,
                  output_subdir='psfgrids',
                  efficient_saving=True):
         
@@ -1651,6 +1681,11 @@ class SpaceConvolution:
         if self.use_gpu:
             print("Warning! GPU implementation still in progress; setting use_gpu to False.")
             self.use_gpu = False
+
+        convolution_method = convolution_method.lower()
+        if convolution_method not in {'auto', 'localized', 'full'}:
+            raise ValueError("convolution_method must be one of 'auto', 'localized', or 'full'.")
+        self.convolution_method = convolution_method
 
 
     def load_concat(self, concat, reference_index=None, coron_offsets=None, fov_pixels=151,
@@ -1754,10 +1789,21 @@ class SpaceConvolution:
                 pupil_shift_y = -0.0022,
                 pupil_rotation = -0.38)
         elif self.image_mask == 'MASK335R':
-            stpsf_options = dict(
-                pupil_shift_x = -0.0125,
-                pupil_shift_y = -0.008,
-                pupil_rotation = -0.595)
+            if self.channel == 'LONG':
+                stpsf_options = dict(
+                    pupil_shift_x = -0.01346839,
+                    pupil_shift_y = -0.00762122,
+                    pupil_rotation = -0.56725767)
+                if self.filt == 'F444W':
+                    stpsf_options['defocus_waves'] = -0.00162708
+            else: # SHORT channel
+                stpsf_options = dict(
+                    pupil_shift_x = 0.00898595,
+                    pupil_shift_y = 0.00132024,
+                    pupil_rotation = -0.08309628)
+                if self.filt == 'F200W':
+                    stpsf_options['defocus_waves'] = -0.00883023
+
         elif self.image_mask == 'FQPM1140':
             stpsf_options = dict(
                 pupil_shift_x = 0.00957944,
@@ -2053,6 +2099,8 @@ class SpaceConvolution:
                 self.psf_inds_osamp = self._psf_inds_osamp
                 self.ny, self.nx = self._ny, self._nx
 
+            self._conv_patch_bounds, self._conv_used_inds = self._compute_patch_bounds(self.psf_inds_osamp, self.psfs.shape)
+
 
     def set_custom_grid(self, psfs, psf_inds_osamp, coron_tmaps_osamp):
         self.psfs = psfs
@@ -2092,14 +2140,32 @@ class SpaceConvolution:
             model_rot = rotate_image(model_osamp, posang, cent=c_star_in_cr_osamp, use_gpu=self.use_gpu, cval0=0)
             model_rot = pad_or_crop_image(model_rot, shape_osamp, cent=c_star_in_cr_osamp, new_cent=c_star_osamp, cval0=0.)
 
-            model_con = convolve_with_spatial_psfs(model_rot, self.psfs, self.psf_inds_osamp[i],
-                                                coron_tmap=self.coron_tmaps_osamp[i],
-                                                use_gpu=self.use_gpu, ncores=self.ncores)
+            model_con = convolve_with_spatial_psfs(model_rot, 
+                                                   self.psfs, 
+                                                   self.psf_inds_osamp[i],
+                                                   coron_tmap=self.coron_tmaps_osamp[i],
+                                                   use_gpu=self.use_gpu, 
+                                                   ncores=self.ncores,
+                                                   method=self.convolution_method,
+                                                   patch_bounds=self._conv_patch_bounds[i],
+                                                   used_inds=self._conv_used_inds[i],
+                                                   )
 
             model_con_out[i] = webbpsf_ext.image_manip.frebin(model_con, scale=1/self.osamp, total=False)
 
         return model_con_out
+    
 
+    def _compute_patch_bounds(self, psf_inds, psfs_shape):
+        patch_bounds = []
+        used_inds = []
+        psf_yhw, psf_xhw = np.ceil(np.array(psfs_shape[-2:])/2.).astype(int)
+        for psf_inds_i in psf_inds:
+            used_inds_i, patch_bounds_i = _get_psf_patch_bounds(psf_inds_i, psfs_shape[0], (psf_yhw, psf_xhw))
+            used_inds.append(used_inds_i)
+            patch_bounds.append(patch_bounds_i)
+        return patch_bounds, used_inds
+        
 
     def __getstate__(self):
         state = self.__dict__.copy()
