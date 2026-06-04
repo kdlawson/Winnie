@@ -1073,7 +1073,7 @@ class SpaceRDI:
                 hdul_out.writeto(fout, overwrite=self.overwrite)
 
 
-    def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False):
+    def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False, model_dict={}):
         """
         Derotates the current circumstellar model and averages over all rolls;
         provides output in a SpaceReduction object to match the output of
@@ -1117,6 +1117,8 @@ class SpaceRDI:
         
         products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
                                   c_star_out=c_derot, output_ext=output_ext)
+        
+        products.primary_header.update(model_dict)
         
         if save_products:
             try:
@@ -1457,6 +1459,7 @@ class SpaceRDI:
         else:
             reduc = reduc_in
 
+        reduc_derotated = bool(getattr(reduc, 'derotated', True))
         reduc_label = f'Deconv {reduc.reduc_label}'
 
         if self.convolver is None or self.convolver.psfs is None:
@@ -1465,19 +1468,38 @@ class SpaceRDI:
                     prepare_convolution.
                                 """)
 
-        deconv_psfs = np.array([webbpsf_ext.image_manip.frebin(rotate_image(self.convolver.psfs, -posang, cval0=0.), scale=1/self.convolver.osamp, total=True) for posang in self._posangs_sci])
+        if reduc_derotated:
+            deconv_psfs = np.array([
+                webbpsf_ext.image_manip.frebin(
+                    rotate_image(self.convolver.psfs, -posang, cval0=0.),
+                    scale=1/self.convolver.osamp, total=True
+                )
+                for posang in self._posangs_sci
+            ])
+        else:
+            # To save memory: one PSF grid used for all rolls if not derotated
+            deconv_psfs = webbpsf_ext.image_manip.frebin(
+                self.convolver.psfs, scale=1/self.convolver.osamp, total=True
+            )[np.newaxis]
+
         deconv_coron_tmaps = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.coron_tmaps_osamp.dtype)
         deconv_psf_inds = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.psf_inds_osamp.dtype)
-        for i,c_coron in enumerate(self.c_coron_sci):
-            deconv_psf_inds[i] = self.convolver.grid_inds_fn(c_coron, self.convolver.psf_offsets_polar, 1, shape=(self.ny, self.nx), 
-                                                                pxscale=self.convolver.pxscale, posang=self._posangs_sci[i], c_star=reduc.c_star)
+
+        for i, c_coron in enumerate(self.c_coron_sci):
+            posang_i = self._posangs_sci[i] if reduc_derotated else 0.0
+            deconv_psf_inds[i] = self.convolver.grid_inds_fn(
+                c_coron, self.convolver.psf_offsets_polar, 1,
+                shape=(self.ny, self.nx), pxscale=self.convolver.pxscale,
+                posang=posang_i, c_star=reduc.c_star, **self.convolver.grid_inds_kwargs
+            )
             if self.convolver.transmission_map_fn is None:
                 deconv_coron_tmaps[i] = 1.
             else:
-                deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=False,
-                                                                            osamp=self.convolver.osamp, nd_squares=False, 
-                                                                            shape=(self.ny, self.nx), posang=self._posangs_sci[i],
-                                                                            c_star=reduc.c_star)
+                deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
+                    self.convolver.inst_webbpsfext, c_coron,
+                    return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
+                    shape=(self.ny, self.nx), posang=posang_i, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs
+                )
 
         if psf_crop_pixels is not None:
             cpsf = 0.5*(np.array([*deconv_psfs.shape[-2:]])-1)[::-1]
@@ -1515,18 +1537,24 @@ class SpaceRDI:
             else:
                 im_deconv_in = None
 
-            out = coronagraphic_richardson_lucy(image_in, deconv_psfs[i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i], num_iter=num_iter,
-                                                im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters, use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask,
-                                                show_progress=show_progress, convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i], conv_used_inds=conv_used_inds[i], **deconv_kws)
-            
-            if return_iters is None:
-                rolls_deconv[i] = np.where(excl_mask_in, image, out)
-                rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
-            else:
-                rolls_deconv[i], deconv_iters[:,i] = np.where(excl_mask_in, image, out[0]), np.where(excl_mask_in, image, out[1])
-                rolls_deconv[i], deconv_iters[:,i] = np.where(init_nans, np.nan, rolls_deconv[i]), np.where(init_nans, np.nan, deconv_iters[:,i])
-
-        im_deconv = np.nanmedian(rolls_deconv, axis=0)
+            psf_i = i if reduc_derotated else 0
+            out = coronagraphic_richardson_lucy(
+                image_in, deconv_psfs[psf_i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i],
+                num_iter=num_iter, im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters,
+                use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask, show_progress=show_progress,
+                convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i],
+                conv_used_inds=conv_used_inds[i], **deconv_kws
+            )
+            if return_iters is not None:
+                deconv_iters[:,i] = np.where(excl_mask_in, image, out[1])
+                deconv_iters[:,i] = np.where(init_nans, np.nan, deconv_iters[:,i])
+                out = out[0]
+            rolls_deconv[i] = np.where(excl_mask_in, image, out)
+            rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
+        if reduc_derotated:
+            im_deconv = np.nanmedian(rolls_deconv, axis=0)
+        else:
+            im_deconv = None
         products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv, c_star_out=reduc.c_star, output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)
         if save_products:
             try:
@@ -2213,6 +2241,7 @@ class SpaceReduction:
             self.c_star = c_star_out
             self.pxscale = spacerdi.pxscale
             self.reduc_label = reduc_label
+            self.derotated = bool(derotated)
 
             if self.im is not None:
                 self.ny, self.nx = self.im.shape
@@ -2254,7 +2283,7 @@ class SpaceReduction:
             
             self.primary_header['MODE'] = reduc_label
             self.primary_header['output_ext'] = output_ext
-
+            self.primary_header['DEROT'] = (self.derotated, 'True if rolls are derotated to N-up')
             self.primary_header['ANNULI'] = spacerdi.optzones.shape[0]
             self.primary_header['CRPIX1'] = self.primary_header['STARCENX'] = c_star_out[0]+1
             self.primary_header['CRPIX2'] = self.primary_header['STARCENY'] = c_star_out[1]+1
@@ -2323,6 +2352,7 @@ class SpaceReduction:
             self.filename = file_to_load
             hdul = fits.open(file_to_load)
             self.primary_header = hdul[0].header
+            self.derotated = bool(self.primary_header.get('DEROT', derotated))
             self.im = (hdul['SCI'].data if 'SCI' in hdul else None)
             self.err = (hdul['ERR'].data if 'ERR' in hdul else None)
             self.reduc_label = self.primary_header.get('MODE', 'UNKNOWN') # backwards compatability

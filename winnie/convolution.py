@@ -322,11 +322,13 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     psf_offsets_in = np.array([xgrid_off, ygrid_off])
 
     psfs = []
+    siaf_ap = inst.siaf[inst.aperturename]
     inst_grid = deepcopy(inst)
     iterator = tqdm(psf_offsets_in.T, leave=False) if show_progress else psf_offsets_in.T
     for psf_offset in iterator:
         inst_grid.options['coron_shift_x'] = -psf_offset[0]
         inst_grid.options['coron_shift_y'] = -psf_offset[1]
+        inst_grid.detector_position = siaf_ap.idl_to_sci(*psf_offset)
         psf = inst_grid.calc_psf(source=source_weights, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize)[2].data
         psfs.append(psf)
     psfs = np.array(psfs)
