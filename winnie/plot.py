@@ -248,7 +248,8 @@ def animate_quick_implot(im_cube, dur=3, titles=None, border_color='k', fig_ax_f
                           title_fontsize=None, outfile=None, save_dpi=250, save_kwargs={}, **quick_implot_kwargs):
     if titles is None: titles = np.arange(len(im_cube)).astype(str)
     else: titles = np.asarray(titles).astype(str)
-    fig,ax = quick_implot(im_cube[0], show=False, **quick_implot_kwargs)
+    show = quick_implot_kwargs.pop('show', False)
+    fig,ax = quick_implot(im_cube[0], show=show, **quick_implot_kwargs)
     children = ax.get_children()
     im_ind = np.where([type(child) == mpl.image.AxesImage for child in children])[0][0]
     implot = children[im_ind]

@@ -28,7 +28,7 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
             4D image array to be PSF-subtracted; shape of (nT, nL, ny, nx) where nT is the number of exposures/integrations, 
             nL is the number of wavelengths, and ny & nx are the number of pixels in each spatial dimension.
             
-        hcube_ref: ndarray, large_arrs=large_arrs
+        hcube_ref: ndarray
             4D image array with shape (nT_ref, nL, ny, nx) where nT_ref is the number of reference
             exposures/integrations, and the remaining axes match those of hcube. 
             

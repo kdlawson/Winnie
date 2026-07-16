@@ -14,19 +14,21 @@ try:
     import stpsf
 except ModuleNotFoundError:
     import webbpsf as stpsf
-    
+import warnings
+
 from .rdi import (rdi_residuals, build_annular_rdi_zones)
 
 from .plot import (mpl, plt, quick_implot, mpl_centered_extent)
 
 from .utils import (robust_mean_combine, median_combine,
                     ang_size_to_px_size, px_size_to_ang_size,
-                    high_pass_filter_sequence, pad_and_rotate_hypercube, rotate_hypercube,
+                    high_pass_filter_sequence, rotate_hypercube,
                     xy_polar_ang_displacement, rotate_image, gaussian_filter_sequence, crop_data,
                     c_to_c_osamp, pad_or_crop_image, dist_to_pt, compute_derot_padding, 
                     nan_median_absolute_deviation)
 
-from .convolution import (_AUTO_CONVOLUTION_MARGIN, _choose_spatial_psf_convolution_strategy, 
+from .convolution import (_AUTO_CONVOLUTION_MARGIN,
+                          _choose_spatial_psf_convolution_strategy, 
                           _get_psf_patch_bounds,
                           convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
@@ -37,6 +39,9 @@ from .convolution import (_AUTO_CONVOLUTION_MARGIN, _choose_spatial_psf_convolut
 
 from .deconvolution import (coronagraphic_richardson_lucy)
 
+from .distortion import (get_siaf_aper, 
+                         distort_image, 
+                         undistort_image)
 
 class SpaceRDI:
     def __init__(self, database=None, output_basedir=None,
@@ -44,9 +49,10 @@ class SpaceRDI:
                  ncores=-1, use_gpu=False, verbose=True, show_plots=False,
                  overwrite=False, prop_err=True, show_progress=False,
                  use_robust_mean=False, robust_clip_nsig=3, pad_data='auto', 
-                 pad_before_derot=False, r_opt=3*u.arcsec, r_sub=None, 
+                 pad_before_derot=False, r_opt=3*u.arcsec, r_sub=None,
+                 correct_distortion=True, 
                  save_coron_transmission=True, save_instance=False, 
-                 efficient_saving=True, from_fits=None):
+                 distort_models=True, efficient_saving=True, from_fits=None):
         """
         Initialize the Winnie class for carrying out RDI on JWST data.
 
@@ -113,10 +119,8 @@ class SpaceRDI:
             the science data. Setting pad_data = None will prevent padding.
 
         pad_before_derot: bool
-            If True, pads data at the derotation step to avoid cutting off
-            pixels during rotation. Redundant if used with pad_data='auto'.
-            Technically slightly more resource efficient than pad_data='auto',
-            but makes some details of forward modeling a lot trickier.
+            Deprecated. Padding before derotation is no longer supported;
+            please use pad_data to avoid cutting off pixels during derotation.
 
         r_opt: array, float, None
             The optimization zone radii to pass as 'r_opt' to
@@ -191,9 +195,12 @@ class SpaceRDI:
             self.robust_clip_nsig = robust_clip_nsig
             self._imc_padding = None
             self.pad_data = pad_data
-            self.pad_before_derot = pad_before_derot
+            if pad_before_derot:
+                raise NotImplementedError("Padding before derotation is no longer supported; please use pad_data to avoid cutting off pixels during derotation.")
             self.r_opt = r_opt
             self.r_sub = r_sub
+            self.distort_models = distort_models
+            self.correct_distortion = correct_distortion
             self.save_coron_transmission = save_coron_transmission
             self.save_instance = save_instance
             self.efficient_saving = efficient_saving
@@ -202,7 +209,7 @@ class SpaceRDI:
                 self.use_gpu = False
        
         
-    def load_concat(self, concat, coron_offsets=None, cropped_shape=None):
+    def load_concat(self, concat, coron_offsets=None, cropped_shape=None, siaf_aper=None):
         """
         Load data for an indicated concatenation in preparation for an RDI
         reduction. By default, this prepares simple annular optimization zones
@@ -303,6 +310,7 @@ class SpaceRDI:
         if 'PUPIL' in h0:
             self._pupil_mask = h0['PUPIL']
         self._aperturename = h0['APERNAME']
+        self._instrument = db_tab[0]['INSTRUME']
         self.filt = h0['FILTER']
 
         self._imcube_sci = np.array(imcube)[sci]
@@ -337,6 +345,11 @@ class SpaceRDI:
         self.set_crop(cropped_shape)
 
         self.rdi_presets()
+
+        if siaf_aper is None:
+            self.siaf_aper = get_siaf_aper(self._aperturename, self._instrument)
+        else:
+            self.siaf_aper = siaf_aper
 
         if self.convolver is not None:
             self.convolver.load_concat(self.concat, **self.convolver_args)
@@ -424,6 +437,7 @@ class SpaceRDI:
 
     def run_rdi(self, save_products=False, return_res_only=False,
                 forward_model=False, collapse_rolls=True, derotate=True,
+                correct_distortion=None,
                 **extra_rdi_settings):
         """
         Runs winnie.rdi.rdi_residuals using settings stored in the SpaceRDI
@@ -482,6 +496,7 @@ class SpaceRDI:
                              """)
         output_ext = copy(self.output_ext)
         reduc_label = copy(self.reduc_label)
+
         if forward_model:
             if (self.rdi_settings.get('coeffs_in', None) is not None) or (extra_rdi_settings.get('coeffs_in', None) is not None):
                 raise ValueError("""
@@ -503,91 +518,151 @@ class SpaceRDI:
         else:
             imcube_sci = self.imcube_sci
             prop_err = self.prop_err
-            
-        pad_before_derot = self.pad_before_derot
-        
-        if not prop_err:# or return_res_only:
-            err_hcube = err_hcube_ref = None
-        else:
+
+        if prop_err:
             err_hcube = self.errcube_sci[:, np.newaxis] 
-            err_hcube_ref = self.errcube_ref[:, np.newaxis]
-        
-        if derotate:
-            posangs = self._posangs_sci
-        else:
-            posangs = None
+            err_hcube_ref = self.errcube_ref[:, np.newaxis]  
+        else: 
+            err_hcube = err_hcube_ref = None
             
         res = rdi_residuals(hcube=imcube_sci[:, np.newaxis],
                             hcube_ref=self.imcube_ref[:, np.newaxis],
-                            optzones=self.optzones, subzones=self.subzones,
-                            posangs=posangs, cent=self.c_star,
-                            use_gpu=self.use_gpu, ncores=self.ncores,
+                            optzones=self.optzones, 
+                            subzones=self.subzones,
+                            use_gpu=self.use_gpu, 
+                            ncores=self.ncores,
                             err_hcube=err_hcube,
                             err_hcube_ref=err_hcube_ref,
-                            pad_before_derot=pad_before_derot,
                             show_progress=self.show_progress,
-                            **self.rdi_settings, **extra_rdi_settings)
+                            **self.rdi_settings,
+                            **extra_rdi_settings)
         
         if return_res_only:
             return res
                 
-        residuals, residuals_err, c_derot = res
+        residuals, residuals_err, _ = res
         
         residuals = residuals[:,0] # dropping unused wavelength axis
-        if residuals_err is not None: 
-            residuals_err = residuals_err[:,0]
+        residuals_err = (None if residuals_err is None else residuals_err[:,0])
+
+        products = self.imcube_to_products(residuals, errcube_in=residuals_err, derotate=derotate, correct_distortion=correct_distortion, 
+                        collapse_rolls=collapse_rolls, output_ext=output_ext, reduc_label=reduc_label, save_products=save_products, 
+                        header_dict={}, add_output_to_db=(not forward_model), include_instance=(self.save_instance and not forward_model))
         
-        if derotate:
-            im_col, err_col = median_combine(residuals, residuals_err)
-        else:
-            im_col, err_col = None, None
+        return products
+    
+
+    def imcube_to_products(self, imcube_in, errcube_in=None, derotate=True, correct_distortion=None, 
+                            collapse_rolls=True, output_ext=None, reduc_label=None, save_products=False, 
+                            header_dict={}, add_output_to_db=False, include_instance=False):
+        
+        if correct_distortion is None:
+            correct_distortion = self.correct_distortion
             
+        if output_ext is None:
+            output_ext = self.output_ext
+        
+        if reduc_label is None:
+            reduc_label = self.reduc_label
+            
+        imcube = imcube_in.copy()
+        errcube = (None if errcube_in is None else errcube_in.copy())
+        
+        c_coron_out = self.c_coron_sci.copy()
+        
+        if correct_distortion:
+            for i, posang in enumerate(self._posangs_sci):
+                # If derotating, undistort_image will perform both derotation and distortion correction with a single interpolation.
+                posang_in = (posang if derotate else 0) 
+                imcube[i], c_coron_out[i] = undistort_image(imcube[i], 
+                                                            self.siaf_aper,
+                                                            self.c_coron_sci[i],
+                                                            pxscale_out=self.pxscale,
+                                                            posang_in=posang_in,
+                                                            osamp=1,
+                                                            method='cubic', # cubic is slower but better fidelity since we don't have the luxury of oversampled pixels
+                                                            fill_value=np.nan,
+                                                            c_star=self.c_star)
+
+                if errcube is not None:
+                    errcube[i] = undistort_image(errcube[i], 
+                                                self.siaf_aper,
+                                                self.c_coron_sci[i],
+                                                pxscale_out=self.pxscale,
+                                                posang_in=posang_in,
+                                                osamp=1,
+                                                method='cubic',
+                                                fill_value=np.nan,
+                                                c_star=self.c_star)[0]
+        else: # not correct_distortion
+            if derotate:
+                imcube = rotate_hypercube(imcube, -self._posangs_sci,
+                                            cent=self.c_star, ncores=self.ncores, 
+                                            use_gpu = self.use_gpu, cval0=np.nan)
+                
+                for i, posang in enumerate(self._posangs_sci):
+                    c_coron_out[i] = xy_polar_ang_displacement(*self.c_coron_sci[i], posang, *self.c_star)
+                    
+                if errcube is not None:
+                    errcube = rotate_hypercube(errcube, -self._posangs_sci,
+                                            cent=self.c_star, ncores=self.ncores,
+                                            use_gpu = self.use_gpu, cval0=np.nan)
+                
+        if derotate:
+            im_col, err_col = median_combine(imcube, errcube)
+        else:        
+            im_col, err_col = None, None
+
         if collapse_rolls:
             im_rolls, err_rolls = [],[]
             uni_visit_ids, uni_visit_inds = np.unique(self._visit_ids_sci, return_index=True)
             uni_visit_ids = uni_visit_ids[np.argsort(uni_visit_inds)]
             for visit_id in uni_visit_ids:
                 visit = self._visit_ids_sci == visit_id
-                im_roll, err_roll = median_combine(residuals[visit], (residuals_err[visit] if prop_err else None))
+                visit_err = (None if errcube is None else errcube[visit])
+                im_roll, err_roll = median_combine(imcube[visit], visit_err)
                 im_rolls.append(im_roll)
                 err_rolls.append(err_roll)
             im_rolls = np.asarray(im_rolls)
-            err_rolls = np.asarray(err_rolls) if prop_err else None
+            err_rolls = None if errcube is None else np.asarray(err_rolls)
         else:
             im_rolls = err_rolls = None
 
-        products = SpaceReduction(spacerdi=self,
-                                  im=im_col,
-                                  rolls=im_rolls,
-                                  err=err_col,
-                                  err_rolls=err_rolls,
-                                  c_star_out=c_derot, 
-                                  output_ext=output_ext,
-                                  derotated=derotate,
-                                  reduc_label=reduc_label)
-        if save_products:
-            if self.save_instance and not forward_model:
-                extra_hdus = [self._to_fits()]
-            else:
-                extra_hdus = []
-            try:
-                products.save(overwrite=self.overwrite, extra_hdus=extra_hdus)
-            except OSError:
-                raise OSError("""
-                      A FITS file for this output_ext + output_dir + concat
-                      already exists! To overwrite existing files, set the
-                      overwrite attribute for your Winnie SpaceRDI instance to
-                      True. Alternatively, either change the output_ext
-                      attribute for your SpaceRDI instance, or select a
-                      different output directory when initializing your
-                      SpaceKLIP database object.
-                      """)
-            if not forward_model:
-                if self.concat in self.database.red and products.filename in self.database.red[self.concat]['FITSFILE']:
-                    self.database.red[self.concat].remove_row(np.where(self.database.red[self.concat]['FITSFILE'] == products.filename)[0][0])
-                self.database.read_jwst_s3_data(products.filename)
-        return products
+        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
+                                err=err_col, err_rolls=err_rolls,
+                                c_star_out=self.c_star, c_coron_out=c_coron_out,
+                                derotated=derotate, distortion_corrected=correct_distortion,
+                                output_ext=output_ext, reduc_label=reduc_label)
 
+        products.primary_header.update(header_dict)
+
+        if save_products:
+            self._save_products(products, include_instance=include_instance, add_output_to_db=add_output_to_db)
+                
+        return products
+    
+
+    def _save_products(self, products, include_instance=False, add_output_to_db=False):
+        if self.save_instance and include_instance:
+            extra_hdus = [self._to_fits()]
+        else:
+            extra_hdus = []
+        try:
+            products.save(overwrite=self.overwrite, extra_hdus=extra_hdus)
+        except OSError:
+            raise OSError("""
+                A FITS file for this output_ext + output_dir + concat
+                already exists! To overwrite existing files, set the
+                overwrite attribute for your Winnie SpaceRDI instance to
+                True. Alternatively, either change the output_ext
+                attribute for your SpaceRDI instance, or select a
+                different output directory when initializing your
+                SpaceKLIP database object.
+                """)
+        if add_output_to_db:
+            if self.concat in self.database.red and products.filename in self.database.red[self.concat]['FITSFILE']:
+                self.database.red[self.concat].remove_row(np.where(self.database.red[self.concat]['FITSFILE'] == products.filename)[0][0])
+            self.database.read_jwst_s3_data(products.filename)
     
     def set_zones(self, optzones, subzones, exclude_opt_nans=True):
         """
@@ -771,7 +846,7 @@ class SpaceRDI:
         self.rdi_settings.update(self.fixed_rdi_settings)
     
     
-    def set_presets(self, presets={}, output_ext='psfsub', reduc_label='Custom RDI (Winnie)'):
+    def set_presets(self, presets={}, output_ext='psfsub', reduc_label='Custom RDI'):
         """
         Generic method to quickly assign a set of arguments to use for
         winnie.rdi.rdi_residuals, while also setting the extension for saved
@@ -787,7 +862,7 @@ class SpaceRDI:
             self.report_current_config()
     
     
-    def rdi_presets(self, output_ext='rdi_psfsub', reduc_label='RDI (Winnie)'):
+    def rdi_presets(self, output_ext='rdi_psfsub', reduc_label='RDI'):
         """
         Set presets to perform a standard RDI reduction.
         ___________
@@ -798,29 +873,33 @@ class SpaceRDI:
         self.set_presets(presets={}, output_ext=output_ext, reduc_label=reduc_label)
     
     
-    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, output_ext='hpfrdi_psfsub', reduc_label='HPFRDI (Winnie)'):
+    def hpfrdi_presets(self, filter_size=None, filter_size_adj=1, niter=1, prop_threshold=0.5, output_ext='hpfrdi_psfsub', reduc_label='HPFRDI'):
         """
         Set presets for High-Pass Filtering RDI (HPFRDI), in which coefficients
         are computed by comparing high-pass filtered science and reference
         data.
-
         ___________
         Parameters:
-            filter_size (float, optional): Size of the high-pass filter. If not
-                provided, it defaults to the value of self._sigma.
-            filter_size_adj (float, optional): Adjustment factor for the filter
-                size. Defaults to 1. output_ext (str, optional): Output file
-                extension for FITS products. Defaults to 'hpfrdi_psfsub'.
+            filter_size: (float, optional)
+                Size of the high-pass filter. If not provided, it defaults to the value of self._sigma.
+            filter_size_adj: (float, optional)
+                Adjustment factor for the filter size. Defaults to 1. 
+            output_ext: (str, optional)
+                Output file extension for FITS products. Defaults to 'hpfrdi_psfsub'.
+            niter: (int, optional)
+                Number of iterations of high-pass filtering to apply. Defaults to 1.
+            prop_threshold (float, optional): Threshold for propagating 
+                nans/zeros in high-pass filtering. Defaults to 0.5.
         """
         if filter_size is None:
             filter_size = self._sigma
         presets = {}
         presets['opt_smoothing_fn'] = high_pass_filter_sequence
-        presets['opt_smoothing_kwargs'] = dict(filtersize=filter_size_adj*filter_size)
+        presets['opt_smoothing_kwargs'] = dict(filtersize=filter_size_adj*filter_size, niter=niter, prop_threshold=prop_threshold)
         self.set_presets(presets=presets, output_ext=output_ext, reduc_label=reduc_label)
     
     
-    def mcrdi_presets(self, output_ext='mcrdi_psfsub', reduc_label='MCRDI (Winnie)'):
+    def mcrdi_presets(self, output_ext='mcrdi_psfsub', reduc_label='MCRDI'):
         """
         Set presets for Model Constrained RDI (MCRDI), in which coefficients
         are computed by comparing reference data to science data from which an
@@ -854,7 +933,7 @@ class SpaceRDI:
                             grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                             grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
                             transmission_map_fn=get_jwst_coron_transmission_map,
-                            transmission_map_kwargs={}):
+                            transmission_map_kwargs={}, use_distorted_psfs=False):
         """
         Sets up the SpaceRDI instance to enable convolution of circumstellar
         scene models by preparing an instance of the SpaceConvolution class and
@@ -964,7 +1043,8 @@ class SpaceRDI:
             self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
-                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving, convolution_method=convolution_method)
+                                              pad_data=self.pad_data, efficient_saving=self.efficient_saving, convolution_method=convolution_method,
+                                              use_distorted_psfs=use_distorted_psfs)
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
@@ -1012,7 +1092,9 @@ class SpaceRDI:
                         To run set_circumstellar_model with a raw model as
                         input, you must first execute prepare_convolution.
                                      """)
-            model_cube = self.convolver.convolve_model(raw_model, pxscale_in=raw_model_pxscale, c_star_in=raw_model_center)
+            
+            distortion_aper = (self.siaf_aper if self.distort_models else None)
+            model_cube = self.convolver.convolve_model(raw_model, pxscale_in=raw_model_pxscale, c_star_in=raw_model_center, distortion_aper=distortion_aper)
 
         if model_cube is None:
             if model_files is None:
@@ -1073,6 +1155,34 @@ class SpaceRDI:
                 hdul_out.writeto(fout, overwrite=self.overwrite)
 
 
+    def make_model_reduc(self, derotate=True, correct_distortion=None, collapse_rolls=True, output_ext='cssmodel',
+                         reduc_label='CSS Model', save_products=False, model_dict={}, match_reduc=None):
+        """
+        Creates a SpaceReduction object of the current CSS model. Set
+        match_reduc to a SpaceReduction object to automatically match the
+        values of correct_distortion, derotate, and collapse_rolls to those of
+        the provided SpaceReduction object.
+        """
+        
+        if self.imcube_css is None:
+            raise ValueError(
+                    """
+                    Prior to executing make_model_reduc, you must
+                    first set a circumstellar model using
+                    set_circumstellar_model.
+                    """)
+        
+        if match_reduc is not None:
+            correct_distortion = match_reduc.distortion_corrected
+            derotate = match_reduc.derotated
+            collapse_rolls = (True if match_reduc.rolls is not None else False)
+        
+        products = self.imcube_to_products(self.imcube_css, errcube_in=None, derotate=derotate, correct_distortion=correct_distortion, 
+                                           collapse_rolls=collapse_rolls, output_ext=output_ext, reduc_label=reduc_label, save_products=save_products, 
+                                           header_dict=model_dict, add_output_to_db=False, include_instance=False)
+        
+        return products
+        
     def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False, model_dict={}):
         """
         Derotates the current circumstellar model and averages over all rolls;
@@ -1080,6 +1190,9 @@ class SpaceRDI:
         run_rdi. If a circumstellar model is not set, this method will raise a
         ValueError.
         """
+        warnings.warn("derotate_and_combine_circumstellar_model is deprecated and will be removed in a future version of Winnie. Use make_model_reduc instead.",
+                       category=DeprecationWarning, stacklevel=2)
+        
         if self.imcube_css is None:
             raise ValueError(
                     """
@@ -1087,58 +1200,19 @@ class SpaceRDI:
                     first set a circumstellar model using
                     set_circumstellar_model.
                     """)
-        
-        pad_before_derot = self.pad_before_derot
-        
-        csscube = self.imcube_css
-        
-        if pad_before_derot:
-            residuals, c_derot = pad_and_rotate_hypercube(csscube, -self._posangs_sci,
-                                                          cent = self.c_star, ncores = self.ncores, 
-                                                          use_gpu = self.use_gpu, cval0=np.nan)
-        else:
-            residuals, c_derot = rotate_hypercube(csscube, -self._posangs_sci,
-                                                  cent = self.c_star, ncores = self.ncores, 
-                                                  use_gpu = self.use_gpu, cval0=np.nan), self.c_star
-                    
-        im_col, _ = median_combine(residuals)
-        
-        if collapse_rolls:
-            im_rolls = []
-            uni_visit_ids, uni_visit_inds = np.unique(self._visit_ids_sci, return_index=True)
-            uni_visit_ids = uni_visit_ids[np.argsort(uni_visit_inds)]
-            for visit_id in uni_visit_ids:
-                visit_filt = self._visit_ids_sci == visit_id
-                im_roll, _ = median_combine(residuals[visit_filt])
-                im_rolls.append(im_roll)
-            im_rolls = np.asarray(im_rolls)
-        else:
-            im_rolls = None
-        
-        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
-                                  c_star_out=c_derot, output_ext=output_ext)
-        
-        products.primary_header.update(model_dict)
-        
-        if save_products:
-            try:
-                products.save(overwrite=self.overwrite)
-            
-            except OSError:
-                raise OSError("""
-                      A FITS file for this output_ext + output_dir + concat
-                      already exists! To overwrite existing files, set the
-                      overwrite attribute for your Winnie SpaceRDI instance to
-                      True. Alternatively, either change the output_ext
-                      attribute for your SpaceRDI instance, or select a
-                      different output directory when initializing your
-                      SpaceKLIP database object.
-                      """)
+                        
+        products = self.make_model_reduc(derotate=True, 
+                                         correct_distortion=None, 
+                                         collapse_rolls=collapse_rolls, 
+                                         output_ext=output_ext, 
+                                         reduc_label='CSS Model', 
+                                         save_products=save_products, 
+                                         model_dict=model_dict)
 
         return products
 
 
-    def make_derot_coron_maps(self, collapse_rolls=False, save_products=False):
+    def make_derot_coron_maps(self, collapse_rolls=False, save_products=False, correct_distortion=None):
         coron_tmaps = np.zeros_like(self.imcube_sci)
         maskfiles = self.database.obs[self.concat]['MASKFILE'][self.database.obs[self.concat]['TYPE']=='SCI']
         inst = None
@@ -1147,8 +1221,7 @@ class SpaceRDI:
                 if self.convolver is not None and self.convolver.coron_tmaps_osamp is not None: # Use the already-loaded transmission map
                     coron_tmaps[i] = webbpsf_ext.image_manip.frebin(self.convolver.coron_tmaps_osamp[i], scale=1./self.convolver.osamp, total=False)
                 else: # generate a transmission map image
-                    if inst is None: # On first iteration, initialize our WebbPSF-ext object
-                        # Swap to prelaunch equivalent mask names for WebbPSF-ext
+                    if inst is None: 
                         if self._pupil_mask.endswith('RND'):
                             pupil_mask_ext = 'CIRCLYOT'
                         elif self._pupil_mask.endswith('WB'):
@@ -1166,65 +1239,36 @@ class SpaceRDI:
                 if self.pad_data is not None:
                     coron_tmap = np.pad(coron_tmap, self._imc_padding[1:], constant_values=np.nan)
                 coron_tmaps[i] = coron_tmap
-        if self.pad_before_derot:
-            coron_tmaps_derot, c_derot = pad_and_rotate_hypercube(coron_tmaps, -self._posangs_sci,
-                                                          cent=self.c_star, ncores=self.ncores, 
-                                                          use_gpu=self.use_gpu, cval0=np.nan)
-        else:
-            coron_tmaps_derot, c_derot = rotate_hypercube(coron_tmaps, -self._posangs_sci,
-                                                  cent=self.c_star, ncores=self.ncores, 
-                                                  use_gpu=self.use_gpu, cval0=np.nan), self.c_star
-                    
-        im_col, _ = median_combine(coron_tmaps_derot)
-        
-        if collapse_rolls:
-            im_rolls = []
-            uni_visit_ids, uni_visit_inds = np.unique(self._visit_ids_sci, return_index=True)
-            uni_visit_ids = uni_visit_ids[np.argsort(uni_visit_inds)]
-            for visit_id in uni_visit_ids:
-                visit_filt = self._visit_ids_sci == visit_id
-                im_roll, _ = median_combine(coron_tmaps_derot[visit_filt])
-                im_rolls.append(im_roll)
-            im_rolls = np.asarray(im_rolls)
-        else:
-            im_rolls = None
 
-        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
-                                  c_star_out=c_derot, output_ext='psfmask')
+        products = self.imcube_to_products(coron_tmaps, errcube_in=None, derotate=True, correct_distortion=correct_distortion,
+                                           collapse_rolls=collapse_rolls, output_ext='psfmask', reduc_label='Coronagraph Transmission Maps',
+                                           save_products=False, header_dict={}, add_output_to_db=False, include_instance=False)
 
         products.filename = products.filename.replace('psfmask_i2d.fits', 'psfmask.fits')
 
         if save_products:
             products.save(overwrite=True)
+
         return products
 
     
-    def make_css_subtracted_residuals(self, data_reduc=None, model_reduc=None, save_products=True, output_suffix='csssub'):
+    def make_css_subtracted_residuals(self, data_reduc=None, model_reduc=None, save_products=True, output_suffix='csssub', add_output_to_db=True):
         if data_reduc is None:
             data_reduc = self.run_rdi(save_products=False)
-            reduc_label = f'CSS-sub {self.reduc_label}'
-        else:
-            reduc_label = f'CSS-sub {data_reduc.reduc_label}'
+            
         if model_reduc is None:
             model_reduc = self.run_rdi(save_products=False, forward_model=True)
+        
+        reduc_label = f'CSS-sub {data_reduc.reduc_label}'
         output_ext = f'{data_reduc.output_ext}_{output_suffix}'
-        products = SpaceReduction(spacerdi=self, im=data_reduc.im-model_reduc.im, rolls=data_reduc.rolls-model_reduc.rolls, c_star_out=data_reduc.c_star, output_ext=output_ext, reduc_label=reduc_label)
+
+        products = data_reduc - model_reduc
+        products.update_output_ext(output_ext)
+        products.update_reduc_label(reduc_label)
+
         if save_products:
-            try:
-                products.save(overwrite=self.overwrite)
-            except OSError:
-                raise OSError("""
-                      A FITS file for this output_ext + output_dir + concat
-                      already exists! To overwrite existing files, set the
-                      overwrite attribute for your Winnie SpaceRDI instance to
-                      True. Alternatively, either change the output_ext
-                      attribute for your SpaceRDI instance, or select a
-                      different output directory when initializing your
-                      SpaceKLIP database object.
-                      """)
-            if self.concat in self.database.red and products.filename in self.database.red[self.concat]['FITSFILE']:
-                self.database.red[self.concat].remove_row(np.where(self.database.red[self.concat]['FITSFILE'] == products.filename)[0][0])
-            self.database.read_jwst_s3_data(products.filename)
+            self._save_products(products, include_instance=self.save_instance, add_output_to_db=add_output_to_db)
+ 
         return products
 
 
@@ -1290,7 +1334,7 @@ class SpaceRDI:
                     self.database.update_obs(self.concat, j, fcss_sub, fmask_out)
         
 
-    def jackknife_references(self, derotate=False, exclude_by_visitid=True, show_progress=True):
+    def jackknife_references(self, derotate=False, correct_distortion=False, exclude_by_visitid=True, show_progress=True):
         """
         If exclude_by_visitid is True, carries out reductions using jackknife
         resampling over each unique visit ID, leaving out all reference images
@@ -1344,10 +1388,10 @@ class SpaceRDI:
         for i in (tqdm(np.unique(inds_JK), leave=False) if show_progress else np.unique(inds_JK)):
             jk_refmask[:,:] = np.invert(inds_JK == i)
             self.rdi_settings['ref_mask'] = jk_refmask
-            hcube_res, err_hcube_res, _ = self.run_rdi(derotate=derotate, return_res_only=True)
-            rescube_JK[i] = hcube_res[:,0]
+            products = self.run_rdi(derotate=derotate, correct_distortion=correct_distortion)
+            rescube_JK[i] = products.rolls
             if self.prop_err:
-                errcube_JK[i] = err_hcube_res[:,0]
+                errcube_JK[i] = products.err_rolls
 
         out = [inds_JK, rescube_JK]
         if self.prop_err:
@@ -1449,7 +1493,7 @@ class SpaceRDI:
 
             if return_iters is not None:
                 deconv_iters: ndarray
-                    A 3D array of shape (len(return_iters), ny, nx) containing
+                    A 4D array of shape (len(return_iters), nrolls, ny, nx) containing
                     the deconvolved images at the iteration numbers specified by
                     return_iters.
         """
@@ -1459,19 +1503,26 @@ class SpaceRDI:
         else:
             reduc = reduc_in
 
-        reduc_derotated = bool(getattr(reduc, 'derotated', True))
         reduc_label = f'Deconv {reduc.reduc_label}'
 
         if self.convolver is None or self.convolver.psfs is None:
                 raise ValueError("""
                     To run deconvolution, you must first execute
-                    prepare_convolution.
+                    prepare_convolution (and fetch a PSF grid).
                                 """)
+        
+        if self.convolver.inst_webbpsfext is None:
+            self.convolver.prepare_webbpsfext_instance(options=self.convolver.stpsf_options)
 
-        if reduc_derotated:
+        if reduc.distortion_corrected:
+            deconv_psfs = fits.getdata(self.convolver._psf_file_nodist)
+        else:
+            deconv_psfs = fits.getdata(self.convolver._psf_file_dist)
+
+        if reduc.derotated:
             deconv_psfs = np.array([
                 webbpsf_ext.image_manip.frebin(
-                    rotate_image(self.convolver.psfs, -posang, cval0=0.),
+                    rotate_image(deconv_psfs, -posang, cval0=0.),
                     scale=1/self.convolver.osamp, total=True
                 )
                 for posang in self._posangs_sci
@@ -1479,14 +1530,14 @@ class SpaceRDI:
         else:
             # To save memory: one PSF grid used for all rolls if not derotated
             deconv_psfs = webbpsf_ext.image_manip.frebin(
-                self.convolver.psfs, scale=1/self.convolver.osamp, total=True
+                deconv_psfs, scale=1/self.convolver.osamp, total=True
             )[np.newaxis]
 
         deconv_coron_tmaps = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.coron_tmaps_osamp.dtype)
         deconv_psf_inds = np.zeros((len(self.c_coron_sci), self.ny, self.nx), dtype=self.convolver.psf_inds_osamp.dtype)
 
         for i, c_coron in enumerate(self.c_coron_sci):
-            posang_i = self._posangs_sci[i] if reduc_derotated else 0.0
+            posang_i = self._posangs_sci[i] if reduc.derotated else 0.0
             deconv_psf_inds[i] = self.convolver.grid_inds_fn(
                 c_coron, self.convolver.psf_offsets_polar, 1,
                 shape=(self.ny, self.nx), pxscale=self.convolver.pxscale,
@@ -1495,11 +1546,20 @@ class SpaceRDI:
             if self.convolver.transmission_map_fn is None:
                 deconv_coron_tmaps[i] = 1.
             else:
-                deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
-                    self.convolver.inst_webbpsfext, c_coron,
-                    return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
-                    shape=(self.ny, self.nx), posang=posang_i, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs
-                )
+                if reduc.distortion_corrected:
+                    deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
+                        self.convolver.inst_webbpsfext, c_coron,
+                        return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
+                        shape=(self.ny, self.nx), posang=posang_i, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
+                else:
+                    tcoron = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=True,
+                                                                 osamp=self.convolver.osamp, nd_squares=False, shape=(self.ny, self.nx), 
+                                                                 posang=0, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
+                    
+                    tcoron = distort_image(tcoron, self.siaf_aper, self.c_coron_sci[i], self.pxscale, posang_out=posang_i,
+                                           osamp=self.convolver.osamp, method='linear', c_star=self.c_star, fill_value=1.)[0]
+                    
+                    deconv_coron_tmaps[i] = webbpsf_ext.image_manip.frebin(tcoron, scale=1/self.convolver.osamp, total=False)
 
         if psf_crop_pixels is not None:
             cpsf = 0.5*(np.array([*deconv_psfs.shape[-2:]])-1)[::-1]
@@ -1522,6 +1582,7 @@ class SpaceRDI:
         iterator = reduc.rolls
         if show_progress:
             iterator = tqdm(iterator, leave=False)
+
         for i,image in enumerate(iterator):
             init_nans = np.isnan(image)
             image_in, nans = image.copy(), init_nans.copy()
@@ -1537,13 +1598,13 @@ class SpaceRDI:
             else:
                 im_deconv_in = None
 
-            psf_i = i if reduc_derotated else 0
+            psf_i = i if reduc.derotated else 0
             out = coronagraphic_richardson_lucy(
-                image_in, deconv_psfs[psf_i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i],
-                num_iter=num_iter, im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters,
-                use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask, show_progress=show_progress,
-                convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i],
-                conv_used_inds=conv_used_inds[i], **deconv_kws
+                        image_in, deconv_psfs[psf_i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i],
+                        num_iter=num_iter, im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters,
+                        use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask, show_progress=show_progress,
+                        convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i],
+                        conv_used_inds=conv_used_inds[i], **deconv_kws
             )
             if return_iters is not None:
                 deconv_iters[:,i] = np.where(excl_mask_in, image, out[1])
@@ -1551,11 +1612,16 @@ class SpaceRDI:
                 out = out[0]
             rolls_deconv[i] = np.where(excl_mask_in, image, out)
             rolls_deconv[i] = np.where(init_nans, np.nan, rolls_deconv[i])
-        if reduc_derotated:
+        if reduc.derotated:
             im_deconv = np.nanmedian(rolls_deconv, axis=0)
         else:
             im_deconv = None
-        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv, c_star_out=reduc.c_star, output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)
+
+        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv,
+                                  c_star_out=reduc.c_star, c_coron_out=reduc.c_coron,
+                                  derotated=reduc.derotated, distortion_corrected=reduc.distortion_corrected,
+                                  output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)
+        
         if save_products:
             try:
                 products.save(overwrite=self.overwrite)
@@ -1683,7 +1749,8 @@ class SpaceConvolution:
                  convolution_method='auto',
                  output_basedir=None,
                  output_subdir='psfgrids',
-                 efficient_saving=True):
+                 efficient_saving=True,
+                 use_distorted_psfs=False):
         
         self.database = database
         self.source_spectrum = source_spectrum
@@ -1694,14 +1761,15 @@ class SpaceConvolution:
         self.overwrite = overwrite
         self.show_progress = show_progress
         self.concat = None
-        self.inst_stpsf = None
-        self.inst_webbpsfext = None
+        self._inst_stpsf = None
+        self._inst_webbpsfext = None
         self._grid_fetched = False
         self.fetch_opd_by_date = fetch_opd_by_date
         self.pad_data = pad_data
         self.efficient_saving = efficient_saving
+        self.use_distorted_psfs = use_distorted_psfs
         self.output_basedir = self.database.output_dir if output_basedir is None else output_basedir
-        self.output_dir = f'{output_basedir}{output_subdir}/'
+        self.output_dir = f'{self.output_basedir}{output_subdir}/'
         if not os.path.isdir(self.output_basedir):
             os.makedirs(self.output_basedir)
         if not os.path.isdir(self.output_dir):
@@ -1714,6 +1782,30 @@ class SpaceConvolution:
         if convolution_method not in {'auto', 'localized', 'full'}:
             raise ValueError("convolution_method must be one of 'auto', 'localized', or 'full'.")
         self.convolution_method = convolution_method
+
+
+    @property
+    def inst_stpsf(self):
+        if self._inst_stpsf is None:
+            self.prepare_stpsf_instance(options=self.stpsf_options)
+        return self._inst_stpsf
+
+
+    @inst_stpsf.setter
+    def inst_stpsf(self, value):
+        self._inst_stpsf = value
+
+
+    @property
+    def inst_webbpsfext(self):
+        if self._inst_webbpsfext is None:
+            self.prepare_webbpsfext_instance(options=self.stpsf_options)
+        return self._inst_webbpsfext
+
+
+    @inst_webbpsfext.setter
+    def inst_webbpsfext(self, value):
+        self._inst_webbpsfext = value
 
 
     def load_concat(self, concat, reference_index=None, coron_offsets=None, fov_pixels=151,
@@ -1783,6 +1875,7 @@ class SpaceConvolution:
         self.channel = header0.get('CHANNEL', None)
         self.instrument = db_tab[0]['INSTRUME']
         self.date = header0['DATE-BEG']
+        
         if 'PUPIL' in header0:
             self.pupil_mask = header0['PUPIL']
         else:
@@ -1844,11 +1937,15 @@ class SpaceConvolution:
         if self.pupil_mask == 'MASKBAR':
             self.pupil_mask = self.pps_aper.split('_')[1]
 
-        self.prepare_stpsf_instance(options=stpsf_options)
+        self.stpsf_options = stpsf_options
 
-        self.prepare_webbpsf_ext_instance(options=stpsf_options)
+        self._psf_file_dist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
+        self._psf_file_nodist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}_nodist.fits'
 
-        self.psf_file = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
+        if self.use_distorted_psfs:
+            self.psf_file = self._psf_file_dist
+        else:
+            self.psf_file = self._psf_file_nodist
 
         self._psf_shift = None
         self._coron_tmaps_osamp = None
@@ -1886,35 +1983,36 @@ class SpaceConvolution:
 
 
     def prepare_stpsf_instance(self, options):
+        opd_query_date = getattr(self, 'opd_query_date', '')
         # If we're setting OPD based on date and the STPSF instance is either
         # not initialized or the date has changed:
-        if self.fetch_opd_by_date and (self.inst_stpsf is None or self.opd_query_date.split('T')[0] != self.date.split('T')[0]):
+        if self.fetch_opd_by_date and (self._inst_stpsf is None or opd_query_date.split('T')[0] != self.date.split('T')[0]):
             if self.pupil_mask.endswith('WB'):
                 reference_file = fits.open(self.reference_file)
                 reference_file[0].header['PUPIL'] = self.pupil_mask
             else:
                 reference_file = self.reference_file
-            self.inst_stpsf = stpsf.setup_sim_to_match_file(reference_file)
-            self.inst_stpsf.options.update(options)
+            self._inst_stpsf = stpsf.setup_sim_to_match_file(reference_file)
+            self._inst_stpsf.options.update(options)
             self.opd_query_date = self.date
         # Otherwise, update the non-OPD elements; This is more or less borrowed
         # from stpsf.setup_sim_to_match_file()
         else: 
-            if self.inst_stpsf is None: # if needed, initialize the STPSF instance
-                self.inst_stpsf = stpsf.instrument(self.instrument)
-            self.inst_stpsf.filter = self.filt
-            self.inst_stpsf.set_position_from_aperture_name(self.aperturename)
-            if self.inst_stpsf.name == 'NIRCam':
+            if self._inst_stpsf is None: # if needed, initialize the STPSF instance
+                self._inst_stpsf = stpsf.instrument(self.instrument)
+            self._inst_stpsf.filter = self.filt
+            self._inst_stpsf.set_position_from_aperture_name(self.aperturename)
+            if self._inst_stpsf.name == 'NIRCam':
                 if self.pupil_mask.startswith('MASK'):
-                    self.inst_stpsf.pupil_mask = self.pupil_mask
-                    self.inst_stpsf.image_mask = self.image_mask                                                   
-                    self.inst_stpsf.set_position_from_aperture_name(self.aperturename)
-            elif self.inst_stpsf.name == 'MIRI':
-                if self.inst_stpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
-                    self.inst_stpsf.image_mask = 'FQPM'+self.filt[1:5]
-                elif self.inst_stpsf.filter == 'F2300C':
-                    self.inst_stpsf.image_mask = 'LYOT2300'
-            self.inst_stpsf.options.update(options)
+                    self._inst_stpsf.pupil_mask = self.pupil_mask
+                    self._inst_stpsf.image_mask = self.image_mask                                                   
+                    self._inst_stpsf.set_position_from_aperture_name(self.aperturename)
+            elif self._inst_stpsf.name == 'MIRI':
+                if self._inst_stpsf.filter in ['F1065C', 'F1140C', 'F1550C']:
+                    self._inst_stpsf.image_mask = 'FQPM'+self.filt[1:5]
+                elif self._inst_stpsf.filter == 'F2300C':
+                    self._inst_stpsf.image_mask = 'LYOT2300'
+            self._inst_stpsf.options.update(options)
              # In case we're initializing with fetch_opd_by_date=False, we need
              # to set a null OPD date so that if self.fetch_opd_by_date is
              # later set to True, the OPD will be loaded when executing this
@@ -1923,7 +2021,7 @@ class SpaceConvolution:
                 self.opd_query_date = '' # null date
 
     
-    def prepare_webbpsf_ext_instance(self, options):
+    def prepare_webbpsfext_instance(self, options):
         # Swap to prelaunch equivalent mask names for WebbPSF-ext
         if self.pupil_mask.endswith('RND'):
             pupil_mask_ext = 'CIRCLYOT'
@@ -1942,7 +2040,7 @@ class SpaceConvolution:
         inst.aperturename = self.aperturename
         inst.oversample = self.osamp
         inst.options.update(options)
-        self.inst_webbpsfext = inst
+        self._inst_webbpsfext = inst
     
 
     def calc_psf_shift(self, source_spectrum=None, oversample=4, nlambda=None):
@@ -1955,7 +2053,6 @@ class SpaceConvolution:
         convolution. If None, the initial source spectrum will be used
         (self.source_spectrum). 
         """
-
         if nlambda is None:
             if self._psfcube_off is not None:
                 nlambda = self._psfcube_off.shape[0]
@@ -2040,7 +2137,7 @@ class SpaceConvolution:
         """
         if os.path.isfile(self.psf_file) and not recalc_psf_grid:
             with fits.open(self.psf_file) as hdul:
-                self.psfs = hdul[0].data
+                self.psfs = hdul[0].data.astype(np.float32)
                 self.psf_offsets_polar = hdul[1].data
                 self.psf_offsets = hdul[2].data
         else:
@@ -2050,11 +2147,23 @@ class SpaceConvolution:
                             shift=self._psf_shift, osamp=self.osamp, fov_pixels=self.fov_pixels,
                             show_progress=self.show_progress, **self.grid_kwargs)
                 
-                self.psfs, self.psf_offsets_polar, self.psf_offsets = out
-                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(self.psfs), 
+                psfs_dist, psfs_nodist, self.psf_offsets_polar, self.psf_offsets = out
+
+                if self.use_distorted_psfs:
+                    self.psfs = psfs_dist
+                else:
+                    self.psfs = psfs_nodist
+
+                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(psfs_dist), 
                                           fits.ImageHDU(self.psf_offsets_polar),
                                           fits.ImageHDU(self.psf_offsets)])
-                hdul.writeto(self.psf_file, overwrite=True)
+                hdul.writeto(self._psf_file_dist, overwrite=True)
+
+                hdul = fits.HDUList(hdus=[fits.PrimaryHDU(psfs_nodist), 
+                                          fits.ImageHDU(self.psf_offsets_polar),
+                                          fits.ImageHDU(self.psf_offsets)])
+                hdul.writeto(self._psf_file_nodist, overwrite=True)
+
             else:
                 self.psfs, self.psf_offsets_polar, self.psf_offsets = None, None, None
             
@@ -2081,9 +2190,10 @@ class SpaceConvolution:
 
     def _fetch_transmission_maps(self):
         if self.transmission_map_fn is not None:
+            inst_webbpsfext = self.inst_webbpsfext
             coron_tmaps_osamp = []
             for c_coron in self._c_coron_sci:
-                coron_tmap = self.transmission_map_fn(self.inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **self.transmission_map_kwargs)
+                coron_tmap = self.transmission_map_fn(inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **self.transmission_map_kwargs)
                 coron_tmaps_osamp.append(coron_tmap)
             self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
         else:
@@ -2138,7 +2248,7 @@ class SpaceConvolution:
         self.set_crop(self.cropped_shape)
 
 
-    def convolve_model(self, model, pxscale_in, c_star_in=None):
+    def convolve_model(self, model, pxscale_in, c_star_in=None, distortion_aper=None):
         if c_star_in is None:
             ny_in, nx_in = model.shape
             c_star_in = (np.array([nx_in, ny_in])-1.)/2.
@@ -2178,6 +2288,9 @@ class SpaceConvolution:
                                                    patch_bounds=self._conv_patch_bounds[i],
                                                    used_inds=self._conv_used_inds[i],
                                                    )
+            if distortion_aper is not None:
+                model_con, _ = distort_image(model_con, distortion_aper, self.c_coron_sci[i], self.pxscale, 0., self.osamp,
+                                              method='linear', c_star=self.c_star, fill_value=0.)
 
             model_con_out[i] = webbpsf_ext.image_manip.frebin(model_con, scale=1/self.osamp, total=False)
 
@@ -2204,15 +2317,22 @@ class SpaceConvolution:
             for key in ['psfs', 'psf_offsets_polar', 'psf_offsets', '_coron_tmaps_osamp', '_psf_inds_osamp']:
                 if key in state:
                     del state[key]
-        if state['inst_stpsf'] is not None and isinstance(state['inst_stpsf'].pupilopd, fits.hdu.hdulist.HDUList):
-            state['inst_stpsf'].pupilopd = None
+        inst_stpsf = state.get('_inst_stpsf', state.get('inst_stpsf'))
+        if inst_stpsf is not None and isinstance(inst_stpsf.pupilopd, fits.hdu.hdulist.HDUList):
+            inst_stpsf.pupilopd = None
         return state
 
 
     def __setstate__(self, state):
+        # Backwards compatibility with pickles saved before lazy PSF properties.
+        if 'inst_stpsf' in state and '_inst_stpsf' not in state:
+            state['_inst_stpsf'] = state.pop('inst_stpsf')
+        if 'inst_webbpsfext' in state and '_inst_webbpsfext' not in state:
+            state['_inst_webbpsfext'] = state.pop('inst_webbpsfext')
+
         self.__dict__.update(state) # Restore attributes
-        if (self.inst_stpsf.pupilopd is None) and self.fetch_opd_by_date:
-            self.inst_stpsf.load_wss_opd_by_date(self.opd_query_date)
+        if (self._inst_stpsf is not None) and (self._inst_stpsf.pupilopd is None) and self.fetch_opd_by_date:
+            self._inst_stpsf.load_wss_opd_by_date(self.opd_query_date)
         if self._grid_fetched:
             if self.efficient_saving: # If the grid had been fetched before, load it again
                 self.fetch_psf_grid(recalc_psf_grid=False)
@@ -2222,7 +2342,8 @@ class SpaceConvolution:
 
 class SpaceReduction:
     def __init__(self, file_to_load=None, spacerdi=None, output_ext=None, im=None, rolls=None, err=None,
-                 err_rolls=None, c_star_out=None, concat=None, derotated=True, reduc_label=''):
+                 err_rolls=None, c_star_out=None, c_coron_out=None, concat=None, derotated=True,
+                 distortion_corrected=True, reduc_label=''):
         """
         Generates a new set of reduction products or load one that was previously saved.
         
@@ -2239,9 +2360,11 @@ class SpaceReduction:
             self.err = err
             self.err_rolls = err_rolls
             self.c_star = c_star_out
+            self.c_coron = c_coron_out
             self.pxscale = spacerdi.pxscale
             self.reduc_label = reduc_label
             self.derotated = bool(derotated)
+            self.distortion_corrected = bool(distortion_corrected)
 
             if self.im is not None:
                 self.ny, self.nx = self.im.shape
@@ -2249,7 +2372,6 @@ class SpaceReduction:
                 self.ny, self.nx = self.rolls.shape[1:]
 
             image_headers = []
-            c_coron_out = []
             uni_visit_inds = np.sort(np.unique(spacerdi._visit_ids_sci, return_index=True)[1])
             for i in uni_visit_inds: # For multi-exposure rolls, retain header info for 1st exposure of each roll
                 with fits.open(spacerdi._files_sci[i]) as hdul:
@@ -2259,7 +2381,6 @@ class SpaceReduction:
                 h1['PXSCALE'] = ((self.pxscale << u.arcsec/u.pixel).value, 'average pixel scale in arcsec/pixel')
                 h1.update(NAXIS1=self.nx, NAXIS2=self.ny, CRPIX1=c_star_out[0]+1, CRPIX2=c_star_out[1]+1)
 
-                c_coron_i = spacerdi.c_coron_sci[i]
                 if derotated:
                     w = wcs.WCS(h1, naxis=[1,2])
                     _rotate_wcs_hdr(w, h1['ROLL_REF'])
@@ -2268,11 +2389,8 @@ class SpaceReduction:
                     h1['CD2_1'] = w.wcs.cd[1, 0]
                     h1['CD2_2'] = w.wcs.cd[1, 1]
 
-                    c_coron_i = xy_polar_ang_displacement(*(c_coron_i-spacerdi.c_star),
-                                                            spacerdi._posangs_sci[i])+c_star_out
-                c_coron_out.append(c_coron_i)
                 
-                h1['CCORON1'], h1['CCORON2'] = zip(c_coron_i+1,
+                h1['CCORON1'], h1['CCORON2'] = zip(self.c_coron[i]+1,
                                                    ['axis 1 coordinate of the coron center',
                                                     'axis 2 coordinate of the coron center'])
                 
@@ -2284,6 +2402,7 @@ class SpaceReduction:
             self.primary_header['MODE'] = reduc_label
             self.primary_header['output_ext'] = output_ext
             self.primary_header['DEROT'] = (self.derotated, 'True if rolls are derotated to N-up')
+            self.primary_header['DISTCORR'] = (self.distortion_corrected, 'True if distortion is corrected')
             self.primary_header['ANNULI'] = spacerdi.optzones.shape[0]
             self.primary_header['CRPIX1'] = self.primary_header['STARCENX'] = c_star_out[0]+1
             self.primary_header['CRPIX2'] = self.primary_header['STARCENY'] = c_star_out[1]+1
@@ -2294,7 +2413,7 @@ class SpaceReduction:
             self.output_ext = output_ext
 
             h1_combined = self.image_headers[0].copy()
-            h1_combined['CCORON1'], h1_combined['CCORON2'] = zip(np.mean(c_coron_out, axis=0)+1,
+            h1_combined['CCORON1'], h1_combined['CCORON2'] = zip(np.mean(self.c_coron, axis=0)+1,
                                                                  ['axis 1 coordinate of the coron center',
                                                                   'axis 2 coordinate of the coron center'])
             self.combined_image_header = h1_combined
@@ -2353,6 +2472,7 @@ class SpaceReduction:
             hdul = fits.open(file_to_load)
             self.primary_header = hdul[0].header
             self.derotated = bool(self.primary_header.get('DEROT', derotated))
+            self.distortion_corrected = bool(self.primary_header.get('DISTCORR', False)) # Default to false; if not in headers, probably run before distortion correction was added
             self.im = (hdul['SCI'].data if 'SCI' in hdul else None)
             self.err = (hdul['ERR'].data if 'ERR' in hdul else None)
             self.reduc_label = self.primary_header.get('MODE', 'UNKNOWN') # backwards compatability
@@ -2422,6 +2542,17 @@ class SpaceReduction:
         return hdul
 
 
+    def update_output_ext(self, new_output_ext):
+        self.filename = self.filename.replace(f'_{self.output_ext}_i2d.fits', f'_{new_output_ext}_i2d.fits')
+        self.output_ext = new_output_ext
+        self.primary_header['output_ext'] = new_output_ext
+
+
+    def update_reduc_label(self, new_reduc_label):
+        self.reduc_label = new_reduc_label
+        self.primary_header['MODE'] = new_reduc_label
+    
+
     def save(self, overwrite=False, extra_hdus=[]):
         hdul = self.to_hdulist()
         hdul += fits.HDUList(extra_hdus)
@@ -2432,3 +2563,187 @@ class SpaceReduction:
                   The file you are attempting to write already exists! Use overwrite=True to overwrite
                   the existing file, or assign a different file name by changing the filename attribute.
                   """)
+        
+
+    def _check_arithmetic_compatibility(self, other):
+        if isinstance(other, SpaceReduction):
+            if self.nx != other.nx or self.ny != other.ny:
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different image dimensions.")
+            if self.derotated != other.derotated:
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different derotation states.")
+            if self.distortion_corrected != other.distortion_corrected:
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different distortion correction states.")
+            if not np.allclose(self.c_star, other.c_star):
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different star center coordinates.")
+            if not np.allclose(self.pxscale, other.pxscale):
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different pixel scales.")
+            if not np.allclose(self.c_coron, other.c_coron):
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with different coronagraph center coordinates.")
+            if (self.im is None) != (other.im is None) or (self.rolls is None) != (other.rolls is None):
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects that are mismatched in whether 'im' or 'rolls' arrays are present.")
+            if (self.rolls is not None) and (other.rolls is not None) and (self.rolls.shape != other.rolls.shape):
+                raise ValueError("Cannot perform arithmetic operations between SpaceReduction objects with mismatched 'rolls' array shapes.")
+            return True
+        elif isinstance(other, (int,float,np.floating,np.integer)):
+            return True
+        return False
+
+
+    def __iadd__(self, other):
+        if not self._check_arithmetic_compatibility(other):
+            return NotImplemented
+
+        if isinstance(other, SpaceReduction):
+            if self.im is not None:
+                im_out = self.im + other.im
+                if (self.err is not None) and (other.err is not None):
+                    err_out = np.hypot(self.err, other.err)
+                elif (self.err is None) and (other.err is not None):
+                    err_out = other.err
+                elif (self.err is not None) and (other.err is None):
+                    err_out = self.err
+                else:
+                    err_out = None
+            else:
+                im_out = None
+                err_out = None
+
+            if self.rolls is not None:
+                rolls_out = self.rolls + other.rolls
+                if (self.err_rolls is not None) and (other.err_rolls is not None):
+                    err_rolls_out = np.hypot(self.err_rolls, other.err_rolls)
+                elif (self.err_rolls is None) and (other.err_rolls is not None):
+                    err_rolls_out = other.err_rolls
+                elif (self.err_rolls is not None) and (other.err_rolls is None):
+                    err_rolls_out = self.err_rolls
+                else:
+                    err_rolls_out = None
+                    
+        else: # other is a float or int
+            if self.im is not None:
+                im_out = self.im + other
+            else:
+                im_out = None
+
+            if self.rolls is not None:
+                rolls_out = self.rolls + other
+            else:
+                rolls_out = None
+
+            err_out = self.err  # Error does not change when adding a constant
+            err_rolls_out = self.err_rolls  # Error does not change when adding a constant
+
+        self.im = im_out
+        self.err = err_out
+        self.rolls = rolls_out
+        self.err_rolls = err_rolls_out
+
+        return self
+    
+
+    def __add__(self, other):
+        if not self._check_arithmetic_compatibility(other):
+            return NotImplemented
+        out = deepcopy(self)
+        out.__iadd__(other)
+        return out
+
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+
+    def __sub__(self, other):
+        return self.__add__(-other)
+    
+
+    def __isub__(self, other):
+        return self.__iadd__(-other)
+
+
+    def __rsub__(self, other):
+        return (-self).__add__(other)
+    
+
+    def __neg__(self):
+        return self.__mul__(-1)
+    
+
+    def __imul__(self, other):
+        if not self._check_arithmetic_compatibility(other):
+            return NotImplemented
+        if isinstance(other, SpaceReduction):
+            if self.im is not None:
+                im_out = self.im * other.im
+                if (self.err is not None) and (other.err is not None):
+                    err_out = np.hypot(self.err * other.im, other.err * self.im)
+                elif (self.err is None) and (other.err is not None):
+                    err_out = other.err * self.im
+                elif (self.err is not None) and (other.err is None):
+                    err_out = self.err * other.im
+                else:
+                    err_out = None
+            else:
+                im_out = None
+                err_out = None
+
+            if self.rolls is not None:
+                rolls_out = self.rolls * other.rolls
+                if (self.err_rolls is not None) and (other.err_rolls is not None):
+                    err_rolls_out = np.hypot(self.err_rolls * other.rolls, other.err_rolls * self.rolls)
+                elif (self.err_rolls is None) and (other.err_rolls is not None):
+                    err_rolls_out = other.err_rolls * self.rolls
+                elif (self.err_rolls is not None) and (other.err_rolls is None):
+                    err_rolls_out = self.err_rolls * other.rolls
+                else:
+                    err_rolls_out = None
+            else:
+                rolls_out = None
+                err_rolls_out = None
+
+        else: # other is a float or int
+            if self.im is not None:
+                im_out = self.im * other
+                err_out = self.err * abs(other) if self.err is not None else None
+            else:
+                im_out = None
+                err_out = None
+
+            if self.rolls is not None:
+                rolls_out = self.rolls * other
+                err_rolls_out = self.err_rolls * abs(other) if self.err_rolls is not None else None
+            else:
+                rolls_out = None
+                err_rolls_out = None
+
+        self.im = im_out
+        self.err = err_out
+        self.rolls = rolls_out
+        self.err_rolls = err_rolls_out
+
+        return self
+
+
+    def __mul__(self, other):
+        if not self._check_arithmetic_compatibility(other):
+            return NotImplemented
+        out = deepcopy(self)
+        out.__imul__(other)
+        return out
+
+
+    def __rmul__(self, other):
+        # other * self
+        return self.__mul__(other)
+    
+
+    def __truediv__(self, other):
+        if not isinstance(other, (int,float,np.floating,np.integer)):
+            return NotImplemented
+        return self.__mul__(1/other)
+    
+
+    def __itruediv__(self, other):
+        if not isinstance(other, (int,float,np.floating,np.integer)):
+            return NotImplemented
+        return self.__imul__(1/other)

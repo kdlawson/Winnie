@@ -4,14 +4,20 @@ from scipy import ndimage
 from joblib import Parallel, delayed
 from photutils.aperture import EllipticalAnnulus, aperture_photometry
 
-def dist_to_pt(pt, nx=201, ny=201, dtype=np.float32):
+
+def dist_to_pt(pt, nx=201, ny=201, dtype=np.float32, return_xy=False):
     """
     Returns a square distance array of size (naxis,naxis), 
     where each pixel corresponds to the euclidean distance of that pixel from the center.
     """
     xaxis = np.arange(0, nx, dtype=dtype)-pt[0]
     yaxis = np.arange(0, ny, dtype=dtype)-pt[1]
-    return np.sqrt(xaxis**2 + yaxis[:, np.newaxis]**2)
+    rg = np.sqrt(xaxis**2 + yaxis[:, np.newaxis]**2)
+    if return_xy:
+        xg = np.broadcast_to(xaxis, rg.shape)
+        yg = np.broadcast_to(yaxis[:, np.newaxis], rg.shape)
+        return (xg, yg, rg)
+    return rg
 
 
 def propagate_nans_in_spatial_operation(a, fn, fn_args=None,
@@ -190,9 +196,12 @@ def gaussian_filter_sequence(im, sigma, prop_threshold=1e-6):
     return im_out
 
 
-def high_pass_filter_sequence(im, filtersize, prop_threshold=1e-6):
+def high_pass_filter_sequence(im, filtersize, prop_threshold=1e-6, niter=1):
     im = np.asarray(im)
-    return im-gaussian_filter_sequence(im, filtersize, prop_threshold=prop_threshold)
+    im_out = im.copy()
+    for _ in range(niter):
+        im_out -= gaussian_filter_sequence(im_out, filtersize, prop_threshold=prop_threshold)
+    return im_out
 
 
 def median_filter_sequence(im, radius=None, size=None, footprint=None, prop_threshold=1e-6):
@@ -286,14 +295,15 @@ def crop_data(data, cent, new_shape, return_indices=False, copy=True):
     return data_cropped, new_cent
 
 
-def xy_polar_ang_displacement(x, y, dtheta):
+def xy_polar_ang_displacement(x, y, dtheta, x0=0, y0=0):
     """
-    Rotates cartesian coordinates x and y by angle dtheta (deg) about (0,0).
+    Rotates cartesian coordinates x and y by angle dtheta (deg) about [x0,y0].
     """
-    r = np.sqrt(x**2+y**2)
-    theta = np.rad2deg(np.arctan2(y,x))
+    dx, dy = x-x0, y-y0
+    r = np.sqrt(dx**2+dy**2)
+    theta = np.rad2deg(np.arctan2(dy, dx))
     new_theta = np.deg2rad(theta+dtheta)
-    newx,newy = r*np.cos(new_theta),r*np.sin(new_theta)
+    newx,newy = r*np.cos(new_theta)+x0, r*np.sin(new_theta)+y0
     return newx,newy
 
 
@@ -301,11 +311,12 @@ def c_to_c_osamp(c, osamp):
     return np.asarray(c)*osamp + 0.5*(osamp-1)
 
 
-def xy_polar_ang_displacement_gpu(x, y, dtheta):
-    r = cp.sqrt(x**2+y**2)
-    theta = cp.rad2deg(cp.arctan2(y,x))
+def xy_polar_ang_displacement_gpu(x, y, dtheta, x0=0, y0=0):
+    dx, dy = x-x0, y-y0
+    r = cp.sqrt(dx**2+dy**2)
+    theta = cp.rad2deg(cp.arctan2(dy, dx))
     new_theta = cp.deg2rad(theta+dtheta)
-    newx,newy = r*cp.cos(new_theta),r*cp.sin(new_theta)
+    newx,newy = r*cp.cos(new_theta)+x0,r*cp.sin(new_theta)+y0
     return newx,newy
 
 
@@ -609,6 +620,84 @@ def setup_jupyter_display(width=95, fontsize=16):
     display(HTML("<style>.container { width:"+str(width)+"% !important; }</style>"))
     display(HTML("<style>.rendered_html { font-size: "+str(fontsize)+"px; }</style>"))
     return None
+
+
+def bin_image(im, binfac=3, err=None, keep_shape=False):
+    """
+    Bin an image (and, optionally, its uncertainty map) by an integer factor.
+
+    Note: this assumes that the uncertainties are uncorrelated and so resulting
+    uncertainties should be assumed to be underestimated otherwise.
+
+    Parameters
+    ----------
+    im : 2D numpy.ndarray
+        Input image.
+    err : 2D numpy.ndarray
+        Input uncertainty map
+    binfac : int
+        Binning factor along Y and X (assumed square bins).
+    keep_shape : bool
+        If True, images are returned with the original shape but with all pixels in a given bin
+        set to the same value.
+
+    Returns
+    -------
+    im_bin : 2D numpy.ndarray
+        Binned image (pixel values are means).
+    err_bin : 2D numpy.ndarray
+        Binned uncertainty map (standard error of the mean).
+    """
+
+    ny0, nx0 = im.shape
+
+    if ny0 % binfac != 0:
+        ypadfull = binfac - (ny0 % binfac)
+    else:
+        ypadfull = 0
+
+    if nx0 % binfac != 0:
+        xpadfull = binfac - (nx0 % binfac)
+    else:
+        xpadfull = 0
+
+    ypad = [0, ypadfull]
+    xpad = [0, xpadfull]
+
+    im_pad = np.pad(im, [ypad, xpad], constant_values=np.nan)
+    ny, nx = im_pad.shape
+
+    # Reshape into (n_y/binfac, binfac, n_x/binfac, binfac)
+    newy = ny // binfac
+    newx = nx // binfac
+
+    binningshape = (newy, binfac, newx, binfac)
+    im_reshaped  = im_pad.reshape(binningshape)
+
+    # Mean of the values
+    im_bin = np.mean(im_reshaped, axis=(1,3), keepdims=keep_shape)
+    if keep_shape:
+        im_bin = np.broadcast_to(im_bin, binningshape).reshape((ny0+ypadfull), (nx0+xpadfull))[:ny0, :nx0]
+        
+    if err is None:
+        return im_bin
+    
+    # Standard error propagation: σ_mean = sqrt(sum σ_i^2) / N
+    # where N = binfac*binfac
+    err_pad = np.pad(err, [ypad, xpad], constant_values=np.nan)
+    unity = np.pad(np.ones_like(im), [ypad, xpad], constant_values=np.nan)
+
+    err_reshaped = err_pad.reshape(binningshape)
+    uni_reshaped = unity.reshape(binningshape)
+    
+    N = np.nansum(uni_reshaped, axis=(1,3), keepdims=keep_shape)
+    
+    err_bin = np.sqrt(np.nansum(err_reshaped**2, axis=(1,3), keepdims=keep_shape))/N
+
+    if keep_shape:
+        err_bin = np.broadcast_to(err_bin, binningshape).reshape((ny0+ypadfull), (nx0+xpadfull))[:ny0, :nx0]
+
+    return im_bin, err_bin
 
 
 def source(fn):

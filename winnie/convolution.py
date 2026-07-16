@@ -8,7 +8,7 @@ from scipy import signal
 from joblib import Parallel, delayed
 from copy import deepcopy
 from tqdm.auto import tqdm
-
+from astropy.io import fits
 
 _AUTO_CONVOLUTION_MARGIN = 0.9
 
@@ -207,7 +207,19 @@ def psf_convolve_cpu(im, psf_im):
     return imcon
 
 
-def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rscale=True, rmin=0.05, rmax=3.5, normalize='exit_pupil', shift=None, osamp=2, fov_pixels=201, show_progress=True):
+def generate_lyot_psf_grid(inst, 
+                           source_spectrum=None, 
+                           nr=12, 
+                           ntheta=4, 
+                           log_rscale=True, 
+                           rmin=0.05, 
+                           rmax=3.5, 
+                           normalize='exit_pupil', 
+                           shift=None, 
+                           osamp=2, 
+                           fov_pixels=201,
+                           nlambda=None,
+                           show_progress=True):
     """
     Creates a grid of synthetic PSFs using an STPSF NIRCam or MIRI object. The
     spatial sampling used here is not appropriate for non-Lyot data. Portions
@@ -284,6 +296,10 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     using a filter profile from WebbPSF-ext and computing our own weights
     instead. 
     """
+    try:
+        import stpsf
+    except ModuleNotFoundError:
+        import webbpsf as stpsf
 
     if source_spectrum is None:
         source_spectrum = stpsf.specFromSpectralType('G2V')
@@ -291,8 +307,8 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     if isinstance(source_spectrum, dict): # Assume it's already a dictionary of weights
         source_weights = source_spectrum
     else:
-        import stpsf
-        nlambda = inst._get_default_nlambda(inst.filter)
+        if nlambda is None:
+            nlambda = inst._get_default_nlambda(inst.filter)
         if isinstance(inst, stpsf.stpsf_core.NIRCam):
             if inst.pupil_mask.endswith('RND'): pupil_mask_ext = 'CIRCLYOT'
             elif inst.pupil_mask.endswith('WB'): pupil_mask_ext = 'WEDGELYOT'
@@ -302,6 +318,8 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
             bandpass_ext = webbpsf_ext.bandpasses.miri_filter(inst.filter)
         source_weights = source_spectrum_to_weights(source_spectrum, bandpass_ext, nlambda)
 
+    nlambda = len(source_weights['wavelengths'])
+    
     # Set up the grid:
     if log_rscale:
         rvals = 10**(np.linspace(np.log10(rmin), np.log10(rmax), nr))
@@ -322,24 +340,38 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     psf_offsets_in = np.array([xgrid_off, ygrid_off])
 
     psfs = []
+    psfs_nodist = []
+    
     siaf_ap = inst.siaf[inst.aperturename]
     inst_grid = deepcopy(inst)
+
+    charge_diffusion_options = dict(charge_diffusion_sigma=inst.options.get('charge_diffusion_sigma', None))
+
     iterator = tqdm(psf_offsets_in.T, leave=False) if show_progress else psf_offsets_in.T
     for psf_offset in iterator:
         inst_grid.options['coron_shift_x'] = -psf_offset[0]
         inst_grid.options['coron_shift_y'] = -psf_offset[1]
+
         inst_grid.detector_position = siaf_ap.idl_to_sci(*psf_offset)
-        psf = inst_grid.calc_psf(source=source_weights, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize)[2].data
-        psfs.append(psf)
+        psf_hdul = inst_grid.calc_psf(source=source_weights, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize, nlambda=nlambda)
+        psfs.append(psf_hdul[2].data)
+
+        hdul_nodist = stpsf.distortion.apply_rotation(fits.HDUList([psf_hdul[0], psf_hdul[0]]), crop=True)
+        psf_nodist = stpsf.detectors.apply_detector_charge_diffusion(hdul_nodist, charge_diffusion_options) # this is applied after astrometric distortion in STPSF, but the difference is small
+        psfs_nodist.append(psf_nodist[1].data)
+   
     psfs = np.array(psfs)
-    
+    psfs_nodist = np.array(psfs_nodist)
+
     extra_shift = np.array([psfs.shape[1]%2-1, psfs.shape[2]%2-1])[::-1]/2.
 
     if shift is not None:
         psfs = np.array([imageregistration.fourier_imshift(psf, shift*osamp+extra_shift) for psf in psfs])
-        
+        psfs_nodist = np.array([imageregistration.fourier_imshift(psf, shift*osamp+extra_shift) for psf in psfs_nodist])
+
     if np.any(extra_shift != 0): # Crop any even axes to odd
         psfs = psfs[:, :int(extra_shift[1]*2), :int(extra_shift[0]*2)]
+        psfs_nodist = psfs_nodist[:, :int(extra_shift[1]*2), :int(extra_shift[0]*2)]
 
     # Science positions in detector pixels
     field_rot = 0 if inst._rotation is None else inst._rotation
@@ -347,7 +379,7 @@ def generate_lyot_psf_grid(inst, source_spectrum=None, nr=12, ntheta=4, log_rsca
     psf_offsets_polar = np.array([rvals_all, thvals_all-field_rot])
     psf_offsets = np.array(webbpsf_ext.coords.rtheta_to_xy(*psf_offsets_polar))
     
-    return psfs, psf_offsets_polar, psf_offsets
+    return psfs, psfs_nodist, psf_offsets_polar, psf_offsets
 
 
 def get_stpsf_model_center_offset(psf_off, osamp, x_sfac=0.25, y_sfac=0.50):
@@ -403,7 +435,7 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp=1, inst=None, shape
     
     if posang != 0:
         if c_star is None:
-            c_star=c_coron
+            c_star = c_coron
         xmap_osamp, ymap_osamp = xy_polar_ang_displacement(xmap_osamp+c_coron[0]-c_star[0], ymap_osamp+c_coron[1]-c_star[1], -posang)
         xmap_osamp, ymap_osamp = xmap_osamp-c_coron[0]+c_star[0], ymap_osamp-c_coron[1]+c_star[1]
     

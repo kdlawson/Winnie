@@ -18,6 +18,7 @@ dependencies = [
     "numpy",
     "pyklip",
     "scipy",
+    "scikit-learn",
     "spaceKLIP",
     "tqdm",
     "photutils",
