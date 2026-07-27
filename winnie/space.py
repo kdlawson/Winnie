@@ -382,7 +382,7 @@ class SpaceRDI:
         self._ny, self._nx = self._imcube_sci.shape[1:]
 
 
-    def set_crop(self, cropped_shape=None, auto_pad_nfwhm=5):
+    def set_crop(self, cropped_shape=None, auto_pad_nfwhm=5, crop_indices=None):
         """
         If cropped_shape is a tuple or two-element array: the desired spatial dimensions
         of the cropped data as [ny, nx].
@@ -394,15 +394,23 @@ class SpaceRDI:
           and adds auto_pad_nfwhm times the effective FWHM in pixels
         - sets the cropped shape such that those separations are included in the FOV.
         """
+
         if cropped_shape == 'auto':
             rmax = np.max(dist_to_pt(self._c_star, nx=self._nx, ny=self._ny)[np.any(self._optzones, axis=0)])
             new_nx = new_ny = int(rmax*2 + auto_pad_nfwhm*self._fwhm)
             cropped_shape = [new_ny, new_nx]
 
-        if cropped_shape is not None:
-            self.cropped_shape = np.asarray(cropped_shape)
-            self.imcube_sci, self.c_star, self._crop_indices = crop_data(self._imcube_sci, self._c_star, self.cropped_shape, return_indices=True, copy=False)
-            y1, y2, x1, x2 = self._crop_indices
+        if (cropped_shape is not None) or (crop_indices is not None): # Apply cropping
+            if crop_indices is None:
+                self.cropped_shape = np.asarray(cropped_shape)
+                self.imcube_sci, self.c_star, self._crop_indices = crop_data(self._imcube_sci, self._c_star, self.cropped_shape, return_indices=True, copy=False)
+                y1, y2, x1, x2 = self._crop_indices
+            else:
+                y1, y2, x1, x2 = self._crop_indices = crop_indices
+                self.imcube_sci = self._imcube_sci[..., y1:y2, x1:x2]
+                self.c_star = self._c_star - np.array([x1,y1])
+                self.cropped_shape = np.array(self.imcube_sci.shape[-2:])
+            
             self.errcube_sci = (None if self._errcube_sci is None else self._errcube_sci[..., y1:y2, x1:x2])
             self.imcube_ref = self._imcube_ref[..., y1:y2, x1:x2]
             self.errcube_ref = (None if self._errcube_ref is None else self._errcube_ref[..., y1:y2, x1:x2])
@@ -1518,6 +1526,9 @@ class SpaceRDI:
             deconv_psfs = fits.getdata(self.convolver._psf_file_nodist)
         else:
             deconv_psfs = fits.getdata(self.convolver._psf_file_dist)
+
+        if self.convolver.blursigma != 0.:
+            deconv_psfs = gaussian_filter_sequence(deconv_psfs, self.convolver.blursigma*self.convolver.osamp, 1)
 
         if reduc.derotated:
             deconv_psfs = np.array([

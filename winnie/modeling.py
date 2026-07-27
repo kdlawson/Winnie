@@ -288,6 +288,9 @@ def generate_nptsrc_model_cube(spacerdi, ptsrc_params, ptsrc_hduls=None, blur_pa
     
     hcube = np.zeros((len(ptsrc_hduls[0]), nr, ny+2*npad, nx+2*npad), dtype=spacerdi.imcube_sci.dtype)
 
+    if spacerdi.convolver.blursigma != 0:
+        blur_kernel = Gaussian2DKernel(spacerdi.convolver.blursigma)
+
     c_star = spacerdi.c_star+npad
     for j, posang in enumerate(spacerdi._posangs_sci):
         c_coron = spacerdi.c_coron_sci[j]+npad
@@ -329,8 +332,12 @@ def generate_nptsrc_model_cube(spacerdi, ptsrc_params, ptsrc_hduls=None, blur_pa
             
             if osamp != 1:
                 im = image_manip.frebin(im, scale=1./osamp, total=True)
-            hcube[i,j] = im
 
+            if spacerdi.convolver.blursigma != 0: # This is applied to the data without oversampling, so is applied likewise here.
+                im = psf_convolve_cpu(im, blur_kernel)
+
+            hcube[i,j] = im
+        
     hcube = (hcube*(u.mJy/u.pixel**2)/spacerdi.pxscale**2).to(u.MJy/u.sr).value
     
     if return_components:
@@ -472,7 +479,7 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, ptsrc_hduls=None, err_weighting=Fal
         siaf_aper = wdb.siaf_aper
         ptsrc_ext = 2
     else:
-        siaf_aper = get_siaf_aper(wdb._aperturename, wdb._instrument, Sci2Idl_coeffs=dist_coeffs, fit_osamp=1)
+        siaf_aper = get_siaf_aper(wdb._aperturename, wdb._instrument, Sci2Idl_coeffs=dist_coeffs)
         ptsrc_ext = 0
         
     autoscale = []

@@ -7,6 +7,7 @@ from scipy.interpolate import RegularGridInterpolator
 from sklearn.preprocessing import PolynomialFeatures
 import pysiaf
 import scipy.linalg as linalg
+from numpy.polynomial.legendre import leggauss
 
 
 def _parse_pxscale(pxscale, siaf_ap):
@@ -347,98 +348,230 @@ def undistort_image(
     return image_undist, c_ref_out
 
 
-def fit_poly_with_constraints(X_poly, target, known_coeffs):
-    n_features = X_poly.shape[1]
+def _make_gauss_legendre_sci_grid(nx, ny, order):
+    """
+    Construct a tensor-product Gauss-Legendre quadrature grid covering the
+    complete science-coordinate domain out to pixel edges in 1-indexed SIAF SCI
+    coordinates, i.e.:
+        x_sci in [0.5, nx + 0.5] 
+        y_sci in [0.5, ny + 0.5]
+
+    Parameters
+    ----------
+    nx, ny : int
+        Science-frame array dimensions.
+
+    order : int
+        Number of Gauss-Legendre nodes per axis.
+
+    Returns
+    -------
+    xsci, ysci : 1D ndarray
+        Flattened quadrature-node coordinates in 1-indexed SIAF SCI
+        coordinates.
+
+    weights : 1D ndarray
+        Flattened tensor-product quadrature weights. The weights sum to nx *
+        ny, the area of the fitted science-coordinate domain.
+    """
+    if not isinstance(order, (int, np.integer)) or order < 1:
+        raise ValueError("order must be a positive integer.")
+
+    # Standard Gauss-Legendre nodes and weights on [-1, 1].
+    tx, wx = leggauss(order)
+    ty, wy = leggauss(order)
+
+    # Map x nodes from [-1, 1] to [0.5, nx + 0.5].
+    xlo, xhi = 0.5, float(nx) + 0.5
+    xsci_1d = (0.5 * (xhi + xlo) + 0.5 * (xhi - xlo) * tx)
+    wx = 0.5 * (xhi - xlo) * wx
+
+    # Map y nodes likewise
+    ylo, yhi = 0.5, float(ny) + 0.5
+    ysci_1d = (0.5 * (yhi + ylo) + 0.5 * (yhi - ylo) * ty)
+    wy = 0.5 * (yhi - ylo) * wy
+
+    xsci, ysci = np.meshgrid(xsci_1d, ysci_1d)
+
+    weights_2d = np.multiply.outer(wy, wx)
+
+    return xsci.ravel(), ysci.ravel(), weights_2d.ravel()
+
+
+def _fit_poly_with_constraints(X, Y, known_coeffs, weights):
+    n_features = X.shape[1]
     all_indices = np.arange(n_features)
 
-    # Mask for unknowns
-    fixed_idx = np.array(list(known_coeffs.keys()), dtype=int)
+    fixed_idx = np.array(sorted(known_coeffs), dtype=int)
     free_idx = np.setdiff1d(all_indices, fixed_idx)
 
-    # Subtract known terms from target
-    X_fixed = X_poly[:, fixed_idx]
-    y_adjusted = target - X_fixed @ np.array([known_coeffs[i] for i in fixed_idx])
-
-    # Fit only the free coefficients
-    X_free = X_poly[:, free_idx]
-
-    coeffs_full = np.zeros(n_features)
-    lu, piv = linalg.lu_factor(X_free.T @ X_free, check_finite=False)
-    coeffs_free = linalg.lu_solve((lu, piv), (X_free.T @ (y_adjusted[:, np.newaxis]))[:,0], check_finite=False)
+    X_fixed = X[:, fixed_idx]
+    X_free = X[:, free_idx]
     
-    coeffs_full[free_idx] = coeffs_free
-    for i, val in known_coeffs.items():
-        coeffs_full[i] = val
-    return coeffs_full
+    fixed_values = np.array([known_coeffs[i] for i in fixed_idx])
+    Y_adjusted = Y - X_fixed @ fixed_values
+    
+    coeffs = np.zeros(n_features, dtype=np.float64)
+    coeffs[fixed_idx] = fixed_values
+
+    sqrt_weights = np.sqrt(weights / weights.sum())
+    X_weighted = X_free * sqrt_weights[:, np.newaxis]
+    Y_weighted = Y_adjusted * sqrt_weights
+
+    # Solve the weighted system
+    coeffs[free_idx], *_ = linalg.lstsq(X_weighted, Y_weighted, check_finite=False, lapack_driver="gelsd")
+    
+    return coeffs
 
 
-def enforce_reversible_transforms(aper, fit_osamp=2, xy_sci_validate=None, print_values=False):
+def enforce_reversible_transforms(aper, use_quad_grid=True, quad_order=None, strict_local_inverse=None, print_values=False):
     """
-    Fits the corresponding Idl2Sci coefficients and sets them to ensure that
-    coordinate transforms are reversible (Idl2Sci <-> Sci2Idl) across the
-    desired subarray. 
-    
-    This is intended to fix the issue of discontinuities in the astrometric
-    distortion across the NIRCam COM. Likely not ideal for NIRCam coronagraphy
-    using atypical subarrays (e.g., FULL). In those cases, distortion likely
-    needs to be applied piecewise with a custom procedure.  
+    Fit Idl2Sci coefficients that minimize residuals for an inverse transform,
+    then set them for the PySIAF aperture.
+
+    Parameters
+    ----------
+    aper : pysiaf aperture
+        Aperture whose Sci2Idl coefficients define the forward transform.
+        Idl2Sci coefficients are modified in place.
+    use_quad_grid : bool
+        If True, fit to weighted samples drawn from a Gauss-Legendre quadrature
+        grid spanning the science detector positions. If False, use uniform
+        weights and fit to the center point of every detector pixel. Use of the
+        quadrature grid should be substantially faster at no cost; the detector
+        grid sampling method is left primarily as a sanity check. 
+    quad_order : int or None
+        Number of quadrature nodes per science-coordinate axis. If None, uses
+        degree**2 + 1, which exactly integrates the squared closure residual
+        when the forward and inverse models both have `degree`. For degree=5,
+        this gives quad_order=26.
+    strict_local_inverse : bool, optional
+        If True, enforce that the fitted Idl2Sci transform is a strict local
+        inverse of the Sci2Idl transform at the reference point. This sets bias
+        terms to zero (by convention) and fixes the values of first order
+        Idl2Sci terms to be the inverse of the Jacobian of the Sci2Idl
+        transform. This option may be preferable when the reference point has
+        physical significance (e.g., the position of the mask for
+        coronagraphy). Defaults to False for FULL apertures and True otherwise.
+    print_values : bool
+        If True, prints the fit inverse coefficients.
+
+    Returns
+    -------
+    aper
+        The input aperture, modified in place.
     """
-    degree = aper.Sci2IdlDeg
-    
-    nx, ny = aper.XSciSize, aper.YSciSize
-    nxfit, nyfit = int(nx*fit_osamp), int(ny*fit_osamp)
-    ysci, xsci = c_to_c_osamp(np.indices((nyfit, nxfit), dtype=np.float64), 1/fit_osamp)+1
-    ysci, xsci = ysci.flatten(), xsci.flatten()
+    degree = int(aper.Sci2IdlDeg)
+    if strict_local_inverse is None:
+        strict_local_inverse = 'FULL' not in aper.AperName
+
+    if use_quad_grid:
+        if quad_order is None:
+            quad_order = degree**2 + 1
+
+        xsci, ysci, weights = _make_gauss_legendre_sci_grid(aper.XSciSize, 
+                                                            aper.YSciSize, 
+                                                            quad_order)
+        
+    else:
+        ysci, xsci = np.indices((aper.YSciSize, aper.XSciSize), dtype=np.float64)+1
+        ysci, xsci = ysci.ravel(), xsci.ravel()
+        weights = np.ones_like(xsci)
+
+    # sci -> idl for sample points
     xidl, yidl = aper.sci_to_idl(xsci, ysci)
 
-    poly = PolynomialFeatures(degree=degree)
-    XY_poly = poly.fit_transform(np.vstack([xidl, yidl]).T)
+    poly = PolynomialFeatures(degree=degree, include_bias=True)
+    XY_poly = poly.fit_transform(np.column_stack((xidl, yidl)))
     
-    known_coeffs_x = {0: 0.0, 1: 1./aper.Sci2IdlX10}
-    known_coeffs_y = {0: 0.0, 2: 1./aper.Sci2IdlY11}
+    # Set constraints for coefficients we can determine analytically / by convention: 
+    if strict_local_inverse:
+        jac = np.array([[aper.Sci2IdlX10, aper.Sci2IdlX11],
+                        [aper.Sci2IdlY10, aper.Sci2IdlY11]])
 
-    xcoeff_names = []
-    ycoeff_names = []
+        jac_inv = np.linalg.inv(jac)
 
-    for par in aper.__dict__:
-        if par.startswith('Idl2SciX') and (aper.__dict__[par] is not None):
-            xcoeff_names.append(par)
-        elif par.startswith('Idl2SciY') and (aper.__dict__[par] is not None):
-            ycoeff_names.append(par)
-
-    coeffs_inv_x = fit_poly_with_constraints(XY_poly, xsci-aper.XSciRef, known_coeffs_x)
-    coeffs_inv_y = fit_poly_with_constraints(XY_poly, ysci-aper.YSciRef, known_coeffs_y)
-
-    for i,s in enumerate(xcoeff_names):
-        aper.__dict__[s] = coeffs_inv_x[i]
-        if print_values:
-            print(s, coeffs_inv_x[i])
-
-    for i,s in enumerate(ycoeff_names):
-        aper.__dict__[s] = coeffs_inv_y[i]
-        if print_values:
-            print(s, coeffs_inv_y[i])
-    
-    if xy_sci_validate is not None:
-        xy_sci_in = np.array(xy_sci_validate)
-        xy_idl = aper.sci_to_idl(*xy_sci_in)
-        xy_sci_out = aper.idl_to_sci(*xy_idl)
-        xy_res = xy_sci_in - xy_sci_out
+        known_coeffs_x = {0: 0.0, 
+                          1: jac_inv[0,0],
+                          2: jac_inv[0,1]}
         
-        print(np.nanmedian(xy_res[0]), np.nanmedian(xy_res[1]))
-        print(np.nanmedian(np.hypot(*xy_res)))
+        known_coeffs_y = {0: 0.0, 
+                          1: jac_inv[1,0],
+                          2: jac_inv[1,1]}
+
+    else:
+        known_coeffs_x = {0: 0.0}
+        known_coeffs_y = {0: 0.0}
+
+    coeffs_inv_x = _fit_poly_with_constraints(XY_poly, xsci - aper.XSciRef, known_coeffs_x, weights)
+    coeffs_inv_y = _fit_poly_with_constraints(XY_poly, ysci - aper.YSciRef, known_coeffs_y, weights)
+
+    xcoeff_names = [f"Idl2SciX{i}{j}" for i in range(degree+1) for j in range(i+1)]
+    ycoeff_names = [f"Idl2SciY{i}{j}" for i in range(degree+1) for j in range(i+1)]
+
+    for name, value in zip(xcoeff_names, coeffs_inv_x):
+        setattr(aper, name, float(value))
+        if print_values:
+            print(name, value)
+
+    for name, value in zip(ycoeff_names, coeffs_inv_y):
+        setattr(aper, name, float(value))
+        if print_values:
+            print(name, value)
+
     return aper
-        
-    
-def get_siaf_aper(aperturename, instrument='NIRCam', Sci2Idl_coeffs={}, enforce_reversability=True, fit_osamp=4, xy_sci_validate=None, print_values=False):
+
+
+def get_siaf_aper(aperturename, instrument='NIRCam', Sci2Idl_coeffs={}, enforce_reversability=True, use_quad_grid=True, quad_order=None, strict_local_inverse=None, print_values=False):
     """
     Fetches the pySIAF aperture for aperturename and instrument, then updates
     any coefficients specified in Sci2Idl_coeffs. Then, if
     enforce_reversability is True, fits the corresponding Idl2Sci coefficients
     and sets them to ensure that coordinate transforms are reversible.
+
+    Parameters
+    ----------
+    aperturename : str
+        Name of the SIAF aperture.
+    instrument : str, optional
+        Name of the instrument (default is 'NIRCam').
+    Sci2Idl_coeffs : dict, optional
+        Dictionary of Sci2Idl coefficients to update in the SIAF aperture (for
+        departing from the nominal distortion model).
+    enforce_reversability : bool, optional
+        If True, enforces that the sci <-> idl coordinate transforms are
+        reversible (default is True).
+    use_quad_grid : bool, optional
+        If True, uses a Gauss-Legendre quadrature grid for fitting inverse
+        (default is True).
+    use_quad_grid : bool
+        If True, fit to weighted samples drawn from a Gauss-Legendre quadrature
+        grid spanning the science detector positions. If False, use uniform
+        weights and fit to the center point of every detector pixel. Use of the
+        quadrature grid should be substantially faster at no cost; the detector
+        grid sampling method is left primarily as a sanity check. 
+    quad_order : int or None
+        Number of quadrature nodes per science-coordinate axis. If None, uses
+        degree**2 + 1, which exactly integrates the squared closure residual
+        when the forward and inverse models both have `degree`. For degree=5,
+        this gives quad_order=26.
+    strict_local_inverse : bool, optional
+        If True, enforce that the fitted Idl2Sci transform is a strict local
+        inverse of the Sci2Idl transform at the reference point. This sets bias
+        terms to zero (by convention) and fixes the values of first order
+        Idl2Sci terms to be the inverse of the Jacobian of the Sci2Idl
+        transform. This option may be preferable when the reference point has
+        physical significance (e.g., the position of the mask for
+        coronagraphy). Defaults to False for FULL apertures and True otherwise.
+    print_values : bool
+        If True, prints the fit inverse coefficients.
     """
     aper = deepcopy(pysiaf.Siaf(instrument)[aperturename])
     aper.__dict__.update(Sci2Idl_coeffs)
     if enforce_reversability:
-        aper = enforce_reversible_transforms(aper, fit_osamp, xy_sci_validate, print_values)
+        aper = enforce_reversible_transforms(aper=aper,
+                                             use_quad_grid=use_quad_grid, 
+                                             quad_order=quad_order, 
+                                             strict_local_inverse=strict_local_inverse,
+                                             print_values=print_values)
     return aper
