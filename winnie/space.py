@@ -934,7 +934,7 @@ class SpaceRDI:
                          output_ext=output_ext, reduc_label=reduc_label)
     
 
-    def prepare_convolution(self, source_spectrum=None, reference_index=0, fov_pixels=151, osamp=2,
+    def prepare_convolution(self, source_spectrum=None, reference_index=None, fov_pixels=151, osamp=2,
                             output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
                             convolution_method='auto',
                             convolver_basedir=None, convolver_subdir='psfgrids', fetch_opd_by_date=True, 
@@ -955,9 +955,10 @@ class SpaceRDI:
         source_spectrum : synphot.spectrum.SourceSpectrum, optional
             The source spectrum to use for generating PSFs for convolution.
         reference_index : int, optional
-            The index of the science exposure that will be used to initialize
+            The index of the Database entry that will be used to initialize
             the STPSF instrument object with STPSF's setup_sim_to_match_file
-            function.
+            function. Default is None, in which case the index of the first
+            'SCI' entry is used.
         fov_pixels : int, optional
             The number of pixels in the field of view. Default is 151.
         osamp : int, optional
