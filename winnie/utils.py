@@ -50,7 +50,7 @@ def propagate_nans_in_spatial_operation(a, fn, fn_args=None,
     if fn_kwargs is None: fn_kwargs = {}
     if fn_nan_kwargs is None: fn_nan_kwargs = fn_kwargs
     
-    nans = np.isnan(a)
+    nans = ~np.isfinite(a)
     any_nans = np.any(nans)
     if any_nans:
         a_out = fn(np.where(nans, 0., a), *fn_args, **fn_kwargs)
@@ -243,7 +243,7 @@ def pad_or_crop_image(im, new_size, cent=None, new_cent=None, cval0=np.nan, nan_
         # No need to treat nans/zeros differently if both centers are integers.
         out_im = pad_or_crop_about_pos(im, cent, new_size, new_cent=new_cent, cval=cval0, prefilter=False, order=0)
     else:    
-        nans = np.isnan(im)
+        nans = ~np.isfinite(im)
         zeros = im == 0.
         any_zeros = np.any(zeros)
         any_nans = np.any(nans)
@@ -335,7 +335,7 @@ def rotate_image_cpu(im, angle, cent=None, new_cent=None, cval0=np.nan, prefilte
 
     if angle == 0.:
         return im.copy()
-    nans = np.isnan(im)
+    nans = ~np.isfinite(im)
     zeros = im == 0.
     any_zeros = np.any(zeros)
     any_nans = np.any(nans)
@@ -373,7 +373,7 @@ def rotate_image_gpu(im0, angle, cent=None, cval0=np.nan, prefilter=True):
     if angle == 0.:
         return im0.copy()
     im = cp.asarray(im0)
-    nans = cp.isnan(im)
+    nans = ~cp.isfinite(im)
     zeros = im == 0.
     any_zeros = cp.any(zeros)
     any_nans = cp.any(nans)
@@ -562,7 +562,7 @@ def radial_calc_1d(im, cent, fn, fn_kwargs={}, dr=0.5, rmin=None, rmax=None, fea
     im_prepped = im.copy()
     if feature_mask is not None:
         im_prepped[feature_mask] = np.nan
-    nans_msk = np.isnan(im_prepped)
+    nans_msk = ~np.isfinite(im_prepped)
     for i, rv in enumerate(rarr):
         ropt = (rmap <= rv + dr) & (rmap >= rv - dr)
         if np.any(ropt):

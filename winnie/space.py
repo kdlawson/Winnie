@@ -731,14 +731,14 @@ class SpaceRDI:
 
         if exclude_opt_nans:
             # First apply to uncropped zones
-            nans_sci = np.any(np.isnan(self._imcube_sci), axis=0)
-            nans_ref = np.any(np.isnan(self._imcube_ref), axis=0)
+            nans_sci = np.any(~np.isfinite(self._imcube_sci), axis=0)
+            nans_ref = np.any(~np.isfinite(self._imcube_ref), axis=0)
             self._optzones = np.where(np.logical_or(nans_sci, nans_ref), False, self._optzones)
 
             # and now the cropped zones (if the cropped data exists)
             if self.cropped_shape is not None:
-                nans_sci = np.any(np.isnan(self.imcube_sci), axis=0)
-                nans_ref = np.any(np.isnan(self.imcube_ref), axis=0)
+                nans_sci = np.any(~np.isfinite(self.imcube_sci), axis=0)
+                nans_ref = np.any(~np.isfinite(self.imcube_ref), axis=0)
                 self.optzones = np.where(np.logical_or(nans_sci, nans_ref), False, self.optzones)
             else:
                 self.optzones = self._optzones
@@ -1120,7 +1120,7 @@ class SpaceRDI:
         else: # Model provided in uncropped shape
             self._imcube_css = model_cube
 
-        self._imcube_css[np.isnan(self._imcube_sci)] = np.nan
+        self._imcube_css[~np.isfinite(self._imcube_sci)] = np.nan
         self.imcube_css = self._imcube_css[..., y1:y2, x1:x2]
 
 
