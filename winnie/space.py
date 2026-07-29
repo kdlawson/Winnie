@@ -1777,6 +1777,7 @@ class SpaceConvolution:
         self._inst_webbpsfext = None
         self._grid_fetched = False
         self.fetch_opd_by_date = fetch_opd_by_date
+        self.opd_query_date = ''
         self.pad_data = pad_data
         self.efficient_saving = efficient_saving
         self.use_distorted_psfs = use_distorted_psfs
@@ -1798,8 +1799,17 @@ class SpaceConvolution:
 
     @property
     def inst_stpsf(self):
-        if self._inst_stpsf is None:
+        change_date = (self.fetch_opd_by_date and getattr(self, 'opd_query_date', '').split('T')[0] != self.date.split('T')[0])
+
+        if (self._inst_stpsf is None
+            or self._inst_stpsf.filter != self.filt
+            or self._inst_stpsf.aperturename != self.aperturename
+            or self._inst_stpsf.image_mask != self.image_mask
+            or self._inst_stpsf.pupil_mask != self.pupil_mask
+            or change_date):
+
             self.prepare_stpsf_instance(options=self.stpsf_options)
+
         return self._inst_stpsf
 
 
@@ -1810,7 +1820,13 @@ class SpaceConvolution:
 
     @property
     def inst_webbpsfext(self):
-        if self._inst_webbpsfext is None:
+        if (self._inst_webbpsfext is None
+            or self._inst_webbpsfext.filter != self.filt
+            or self._inst_webbpsfext.aperturename != self.aperturename
+            or self._inst_webbpsfext.image_mask != self.image_mask
+            or self._inst_webbpsfext.pupil_mask != self._pupil_mask_ext
+            or self._inst_webbpsfext.fov_pix != self.fov_pixels
+            or self._inst_webbpsfext.oversample != self.osamp):
             self.prepare_webbpsfext_instance(options=self.stpsf_options)
         return self._inst_webbpsfext
 
@@ -1916,35 +1932,35 @@ class SpaceConvolution:
         if self.pad_data is not None: self._apply_padding()
 
         # Will eventually store these data in a more mutable format
+        stpsf_options = dict(
+                pupi_shift_x = 0.0,
+                pupil_shift_y = 0.0,
+                pupil_rotation = 0.0,
+                defocus_waves = 0.0
+                )
+        
         if self.image_mask == 'MASK210R':
-            stpsf_options = dict(
-                pupil_shift_x = -0.0045,
-                pupil_shift_y = -0.0022,
-                pupil_rotation = -0.38)
+            stpsf_options['pupil_shift_x'] = -0.0045
+            stpsf_options['pupil_shift_y'] = -0.0022
+            stpsf_options['pupil_rotation'] = -0.38
         elif self.image_mask == 'MASK335R':
             if self.channel == 'LONG':
-                stpsf_options = dict(
-                    pupil_shift_x = -0.01346839,
-                    pupil_shift_y = -0.00762122,
-                    pupil_rotation = -0.56725767)
+                stpsf_options['pupil_shift_x'] = -0.01346839
+                stpsf_options['pupil_shift_y'] = -0.00762122
+                stpsf_options['pupil_rotation'] = -0.56725767
                 if self.filt == 'F444W':
                     stpsf_options['defocus_waves'] = -0.00162708
             else: # SHORT channel
-                stpsf_options = dict(
-                    pupil_shift_x = 0.00898595,
-                    pupil_shift_y = 0.00132024,
-                    pupil_rotation = -0.08309628)
+                stpsf_options['pupil_shift_x'] = 0.00898595
+                stpsf_options['pupil_shift_y'] = 0.00132024
+                stpsf_options['pupil_rotation'] = -0.08309628
                 if self.filt == 'F200W':
                     stpsf_options['defocus_waves'] = -0.00883023
-
         elif self.image_mask == 'FQPM1140':
-            stpsf_options = dict(
-                pupil_shift_x = 0.00957944,
-                pupil_shift_y = 0.01387777,
-                pupil_rotation = -0.10441008,
-                defocus_waves = 0.01478258)
-        else:
-            stpsf_options = {}
+            stpsf_options['pupil_shift_x'] = 0.00957944
+            stpsf_options['pupil_shift_y'] = 0.01387777
+            stpsf_options['pupil_rotation'] = -0.10441008
+            stpsf_options['defocus_waves'] = 0.01478258
 
         if self.pupil_mask == 'MASKBAR':
             self.pupil_mask = self.pps_aper.split('_')[1]
@@ -2036,19 +2052,20 @@ class SpaceConvolution:
     def prepare_webbpsfext_instance(self, options):
         # Swap to prelaunch equivalent mask names for WebbPSF-ext
         if self.pupil_mask.endswith('RND'):
-            pupil_mask_ext = 'CIRCLYOT'
+            self._pupil_mask_ext = 'CIRCLYOT'
         elif self.pupil_mask.endswith('WB'):
-            pupil_mask_ext = 'WEDGELYOT'
+            self._pupil_mask_ext = 'WEDGELYOT'
         else:
-            pupil_mask_ext = self.pupil_mask
+            self._pupil_mask_ext = self.pupil_mask
 
         # Currently we only use webbpsf_ext for transmission maps, which aren't OPD dependent.
         if self.instrument == 'NIRCAM':
-            inst = webbpsf_ext.NIRCam_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self.image_mask,
+            inst = webbpsf_ext.NIRCam_ext(filter=self.filt, pupil_mask=self._pupil_mask_ext, image_mask=self.image_mask,
                                          fov_pix=self.fov_pixels, oversample=self.osamp)
         else:
-            inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self.image_mask,
+            inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=self._pupil_mask_ext, image_mask=self.image_mask,
                                         fov_pix=self.fov_pixels, oversample=self.osamp)
+            
         inst.aperturename = self.aperturename
         inst.oversample = self.osamp
         inst.options.update(options)

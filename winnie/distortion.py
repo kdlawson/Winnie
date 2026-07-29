@@ -74,17 +74,11 @@ def _interp_image(image, x_grid, y_grid, x_samp, y_samp,
                   method='cubic', fill_value=0., prop_nans=True, prop_threshold=0.1):
     
     if (prop_nans) and (method not in ['nearest', 'linear']):
-        nans = np.isnan(image)
+        nans = ~np.isfinite(image)
         any_nans = np.any(nans)
         
     if (not prop_nans) or (method in ['nearest', 'linear']) or (not any_nans):
-        interpolator = RegularGridInterpolator(
-            (y_grid[:, 0], x_grid[0]),
-            image,
-            method=method,
-            bounds_error=False,
-            fill_value=fill_value)
-
+        interpolator = RegularGridInterpolator((y_grid[:, 0], x_grid[0]), image, method=method, bounds_error=False, fill_value=fill_value)
         out = interpolator(np.array([y_samp.ravel(), x_samp.ravel()]).T)
         
     else:
