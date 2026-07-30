@@ -356,7 +356,7 @@ class SpaceRDI:
 
         if self.save_coron_transmission:
             outfile = self.output_dir + self.concat + '_psfmask.fits'
-            if not os.path.exists(outfile) or np.shape(fits.getdata(outfile)) != [self.ny, self.nx]:
+            if not os.path.exists(outfile) or np.shape(fits.getdata(outfile)) != (self.ny, self.nx):
                 _ = self.make_derot_coron_maps(collapse_rolls=False, save_products=True)
 
 
