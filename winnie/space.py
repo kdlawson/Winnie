@@ -1942,7 +1942,7 @@ class SpaceConvolution:
 
         # Will eventually store these data in a more mutable format
         stpsf_options = dict(
-                pupi_shift_x = 0.0,
+                pupil_shift_x = 0.0,
                 pupil_shift_y = 0.0,
                 pupil_rotation = 0.0,
                 defocus_waves = 0.0
