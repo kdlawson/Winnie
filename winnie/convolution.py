@@ -345,8 +345,6 @@ def generate_lyot_psf_grid(inst,
     siaf_ap = inst.siaf[inst.aperturename]
     inst_grid = deepcopy(inst)
 
-    charge_diffusion_options = dict(charge_diffusion_sigma=inst.options.get('charge_diffusion_sigma', None))
-
     iterator = tqdm(psf_offsets_in.T, leave=False) if show_progress else psf_offsets_in.T
     for psf_offset in iterator:
         inst_grid.options['coron_shift_x'] = -psf_offset[0]
@@ -356,9 +354,8 @@ def generate_lyot_psf_grid(inst,
         psf_hdul = inst_grid.calc_psf(source=source_weights, fov_pixels=fov_pixels, oversample=osamp, normalize=normalize, nlambda=nlambda)
         psfs.append(psf_hdul[2].data)
 
-        hdul_nodist = stpsf.distortion.apply_rotation(fits.HDUList([psf_hdul[0], psf_hdul[0]]), crop=True)
-        psf_nodist = stpsf.detectors.apply_detector_charge_diffusion(hdul_nodist, charge_diffusion_options) # this is applied after astrometric distortion in STPSF, but the difference is small
-        psfs_nodist.append(psf_nodist[1].data)
+        psf_hdul = apply_partial_dist_to_stpsf_hdul(psf_hdul, inst_grid)
+        psfs_nodist.append(psf_hdul[0].data)
    
     psfs = np.array(psfs)
     psfs_nodist = np.array(psfs_nodist)
@@ -455,7 +452,7 @@ def get_jwst_psf_grid_inds(c_coron, psf_offsets_polar, osamp=1, inst=None, shape
     return psf_inds
 
 
-def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp=None, nd_squares=True, shape=None, posang=0, c_star=None):
+def get_jwst_coron_transmission_map(inst_ext, c_coron, return_oversample=True, osamp=None, nd_squares=True, shape=None, posang=0, c_star=None):
     """
     Generates a coronagraph transmission map relative to position c_coron
     (detector sampled [x,y] in pixels) using inst — a WebbPSF-ext instrument
@@ -466,19 +463,19 @@ def get_jwst_coron_transmission_map(inst, c_coron, return_oversample=True, osamp
     """
 
     if shape is None:
-        ny, nx = inst.siaf_ap.YSciSize, inst.siaf_ap.XSciSize
+        ny, nx = inst_ext.siaf_ap.YSciSize, inst_ext.siaf_ap.XSciSize
     else:
         ny, nx = shape
 
     if osamp is None:
-        osamp = inst.oversample
-    elif osamp != inst.oversample:
-        inst.oversample = osamp
+        osamp = inst_ext.oversample
+    elif osamp != inst_ext.oversample:
+        inst_ext.oversample = osamp
         
-    if isinstance(inst, webbpsf_ext.webbpsf_ext_core.MIRI_ext):
-        im_mask_osamp = inst.gen_mask_image(npix=max(nx,ny)*osamp*2, pixelscale=inst.pixelscale/osamp)
+    if isinstance(inst_ext, webbpsf_ext.webbpsf_ext_core.MIRI_ext):
+        im_mask_osamp = inst_ext.gen_mask_image(npix=max(nx,ny)*osamp*2, pixelscale=inst_ext.pixelscale/osamp)
     else:
-        im_mask_osamp = inst.gen_mask_image(npix=max(ny,nx)*osamp*2, nd_squares=nd_squares, pixelscale=inst.pixelscale/osamp)
+        im_mask_osamp = inst_ext.gen_mask_image(npix=max(ny,nx)*osamp*2, nd_squares=nd_squares, pixelscale=inst_ext.pixelscale/osamp)
 
     if posang != 0:
         if c_star is None:  
@@ -519,6 +516,42 @@ def source_spectrum_to_weights(source_spectrum, bandpass_ext, nlambda):
     binflux = obs.sample_binned(flux_unit='counts').value
     weights = binflux / binflux.sum()
     return {'wavelengths': wave_um*1e-6, 'weights': weights}
+
+
+def apply_partial_dist_to_stpsf_hdul(hdul, inst):
+    """
+    Applies all steps typically applied to an STPSF "OVERDIST" HDU to the
+    'OVERSAMP' HDU except for astrometric distortion. The 'OVERSAMP' extension
+    of the returned HDUList is then what we typically use for forward modeling
+    in Winnie (where astrometric distortion is applied separately to the final
+    image).
+    """
+    try:
+        import stpsf
+    except ModuleNotFoundError:
+        import webbpsf as stpsf
+
+    charge_diffusion_options = dict(charge_diffusion_sigma=inst.options.get('charge_diffusion_sigma', None))
+    add_ipc = inst.options.get('add_ipc', True)
+    # For NIRCam, the standard procedure is rotation >> distortion >> charge
+    # diffusion >> IPC (leaving in NIRISS/FGS functionality in case someone needs it)
+    # For MIRI, it's distortion >> scattering >> charge diffusion >> IPC
+    if inst.name in ['NIRCam', 'NIRISS', 'FGS']:
+        hdul_pdist = stpsf.distortion.apply_rotation(fits.HDUList([hdul[0], hdul[0]]), crop=True)
+    elif inst.name == 'MIRI':
+        hdul_pdist = stpsf.detectors.apply_miri_scattering(fits.HDUList([hdul[0], hdul[0]]))
+    else:
+        raise ValueError(f"Unsupported instrument {inst.name}")
+    
+    # Charge diff and IPC are applied after astrometric distortion in STPSF,
+    # but the difference is negligible unless astrometric distortion is huge
+    hdul_pdist = stpsf.detectors.apply_detector_charge_diffusion(hdul_pdist, charge_diffusion_options)
+    hdul_pdist[1].name = 'OVERDIST'
+    if add_ipc:
+        hdul_pdist = stpsf.detectors.apply_detector_ipc(hdul_pdist, extname='OVERDIST')
+    hdul[0] = hdul_pdist[1]
+    hdul[0].name = 'OVERSAMP'
+    return hdul
 
 
 try:
