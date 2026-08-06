@@ -9,6 +9,7 @@ from scipy.spatial import cKDTree
 from scipy.interpolate import LinearNDInterpolator, CloughTocher2DInterpolator
 import numpy as np
 from importlib.resources import files
+from .distortion import undistort_image
 
 _RESOURCE_DIR = files("winnie") / 'resources'
 
@@ -336,13 +337,14 @@ def generate_fqpm_psf_grid(inst, source_spectrum=None, shift=None, osamp=2, fov_
         inst_grid.detector_position = siaf_ap.idl_to_sci(*psf_offset) # Set det position to get correct field dep WF aberration
 
         psf_hdul = inst_grid.calc_psf(source=source_spectrum, fov_pixels=fov_pixels0, oversample=osamp, normalize=normalize, nlambda=nlambda)
-
         psfs[i] = pad_or_crop_image(psf_hdul[2].data, [osamp*fov_pixels, osamp*fov_pixels], order=5, cent=c_to_c_osamp(c0 + psf_offset_px - shift, osamp) - extra_shift)
-        fits.writeto(f_tmp, psfs, overwrite=True)
 
         psf_hdul = apply_partial_dist_to_stpsf_hdul(psf_hdul, inst_grid)
         psfs_nodist[i] = pad_or_crop_image(psf_hdul[0].data, [osamp*fov_pixels, osamp*fov_pixels], order=5, cent=c_to_c_osamp(c0 + psf_offset_px - shift, osamp) - extra_shift)
-        fits.writeto(f_tmp_nodist, psfs_nodist, overwrite=True)
+
+        if i%100 == 0: # Save to disk every 100 PSFs in case of interruption
+            fits.writeto(f_tmp, psfs, overwrite=True)
+            fits.writeto(f_tmp_nodist, psfs_nodist, overwrite=True)
 
     os.remove(f_tmp)
     os.remove(f_tmp_nodist)
@@ -623,7 +625,9 @@ def get_fqpm_transmission_map(inst_ext, c_coron, return_oversample=True, osamp=N
     an interpolated FQPM map of any dimension / oversampling.
 
     With nrExtrap > 0, the outermost radial samples are carefully extrapolated
-    to fill in the FOV out to the largest radius probed.  
+    to fill in the FOV to the largest radius probed. This is reasonably
+    accurate with the included samples, but care will be required if you're
+    generating your own transmission samples.
     
     Note 1: the FQPM samples were derived for an oversampling factor of 2, so
     fidelity may suffer for osamp > 2.
@@ -638,7 +642,7 @@ def get_fqpm_transmission_map(inst_ext, c_coron, return_oversample=True, osamp=N
     computing a dense STPSF model grid with normalize='first', and then
     generating the same grid a 2nd time with normalize='exit_pupil'. The
     transmission for each position is then the ratio of the 'first' to
-    'exit_pupil' PSF sums. 
+    'exit_pupil' PSF sums, divided by the overall FQPM transmission (0.6). 
     """
     from astropy.table import Table
     if shape is None:
@@ -718,13 +722,27 @@ def get_fqpm_transmission_map(inst_ext, c_coron, return_oversample=True, osamp=N
     psf_pos_sci = psf_offsets_sci + c_coron[:, None]
 
     im_mask_osamp = _make_pixel_averaged_transmission_map(*psf_pos_sci, 
-                                                         psf_tr, 
-                                                         xOut, 
-                                                         yOut, 
-                                                         Nhalfsamp=interp_Nhalfsamp, 
-                                                         method=interp_method, 
-                                                         fill_value=interp_fill_value
-                                                        )
+                                                          psf_tr, 
+                                                          xOut, 
+                                                          yOut, 
+                                                          Nhalfsamp=interp_Nhalfsamp, 
+                                                          method=interp_method, 
+                                                          fill_value=interp_fill_value
+                                                          )
+
+    # The comparable NIRCam / Lyot function returns undistorted transmission
+    # maps. However, the maps here are effectively already distorted by our
+    # mapping of idl >> sci coords. The better approach is to adjust the
+    # coordinate samples above before passing into
+    # _make_pixel_averaged_transmission_map. However, as a quick fix, we're
+    # just distortion correcting the output here instead.
+    im_mask_osamp, _ = undistort_image(im_mask_osamp,
+                                       inst_ext.siaf_ap,
+                                       c_coron,
+                                       pxscale_out=inst_ext.pixelscale,
+                                       osamp=osamp,
+                                       method='linear',
+                                       fill_value=0)
 
     if return_oversample:
         return im_mask_osamp
