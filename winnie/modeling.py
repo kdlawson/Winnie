@@ -1,6 +1,6 @@
 from .utils import (xy_polar_ang_displacement, c_to_c_osamp, pad_or_crop_image, px_size_to_ang_size, ang_size_to_proj_sep, ang_size_to_px_size, dist_to_pt)
 from .distortion import get_siaf_aper
-from .convolution import psf_convolve_cpu
+from .convolution import (psf_convolve_cpu, apply_partial_dist_to_stpsf_hdul)
 from .rdi import (compute_rdi_coefficients)
 
 import numpy as np
@@ -234,8 +234,6 @@ def generate_ptsrc_hduls(spacerdi, ptsrc_params, spectrum=None, fov_pixels=151, 
     siaf_aper = inst.siaf[inst.aperturename]
     options = deepcopy(inst.options)
     ptsrc_hduls = []
-    
-    charge_diffusion_options = dict(charge_diffusion_sigma=inst.options.get('charge_diffusion_sigma', None))
 
     for j, posang in enumerate(spacerdi._posangs_sci):
         c_coron = spacerdi.c_coron_sci[j]
@@ -251,10 +249,7 @@ def generate_ptsrc_hduls(spacerdi, ptsrc_params, spectrum=None, fov_pixels=151, 
             source = (spectrum[i] if isinstance(spectrum, list) else spectrum)
 
             hdul = inst.calc_psf(source=source, fov_pixels=fov_pixels, oversample=osamp, nlambda=nlambda, normalize=normalize)
-            
-            hdul_nodist = stpsf.distortion.apply_rotation(fits.HDUList([hdul[0], hdul[0]]), crop=True)
-            hdul[0] = stpsf.detectors.apply_detector_charge_diffusion(hdul_nodist, charge_diffusion_options)[1] # this is applied after astrometric distortion in STPSF, but the difference is small
-        
+            hdul = apply_partial_dist_to_stpsf_hdul(hdul, inst)
             ptsrc_hduls_roll.append(hdul)
 
         ptsrc_hduls.append(ptsrc_hduls_roll)

@@ -938,9 +938,9 @@ class SpaceRDI:
                             output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
                             convolution_method='auto',
                             convolver_basedir=None, convolver_subdir='psfgrids', fetch_opd_by_date=True, 
-                            grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
-                            grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
-                            transmission_map_fn=get_jwst_coron_transmission_map,
+                            grid_fn=None, grid_kwargs={}, 
+                            grid_inds_fn=None, grid_inds_kwargs={},
+                            transmission_map_fn=None,
                             transmission_map_kwargs={}, use_distorted_psfs=False):
         """
         Sets up the SpaceRDI instance to enable convolution of circumstellar
@@ -1024,7 +1024,7 @@ class SpaceRDI:
           should be used for convolution of that pixel. It should have the
           following signature:
                 grid_inds_fn(c_coron, psf_offsets_polar, osamp=2, shape=None,
-                pxscale=None, **grid_inds_kwargs)
+                pxscale=None, inst=None, **grid_inds_kwargs)
           See winnie.convolution.get_jwst_psf_grid_inds for documentation
           regarding these arguments.
 
@@ -1191,6 +1191,7 @@ class SpaceRDI:
                                            header_dict=model_dict, add_output_to_db=False, include_instance=False)
         
         return products
+        
         
     def derotate_and_combine_circumstellar_model(self, collapse_rolls=True, output_ext='cssmodel', save_products=False, model_dict={}):
         """
@@ -1551,10 +1552,17 @@ class SpaceRDI:
         for i, c_coron in enumerate(self.c_coron_sci):
             posang_i = self._posangs_sci[i] if reduc.derotated else 0.0
             deconv_psf_inds[i] = self.convolver.grid_inds_fn(
-                c_coron, self.convolver.psf_offsets_polar, 1,
-                shape=(self.ny, self.nx), pxscale=self.convolver.pxscale,
-                posang=posang_i, c_star=reduc.c_star, **self.convolver.grid_inds_kwargs
-            )
+                c_coron, 
+                self.convolver.psf_offsets_polar,
+                1,
+                shape=(self.ny, self.nx), 
+                pxscale=self.convolver.pxscale,
+                posang=posang_i, 
+                inst=self.convolver.inst_stpsf,
+                c_star=reduc.c_star, 
+                **self.convolver.grid_inds_kwargs
+                )
+            
             if self.convolver.transmission_map_fn is None:
                 deconv_coron_tmaps[i] = 1.
             else:
@@ -1838,7 +1846,8 @@ class SpaceConvolution:
 
     def load_concat(self, concat, reference_index=None, coron_offsets=None, fov_pixels=151,
                     osamp=2, output_ext='psfs', prefetch_psf_grid=True, recalc_psf_grid=False,
-                    cropped_shape=None, grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
+                    cropped_shape=None, 
+                    grid_fn=generate_lyot_psf_grid, grid_kwargs={}, 
                     grid_inds_fn=get_jwst_psf_grid_inds, grid_inds_kwargs={},
                     transmission_map_fn=get_jwst_coron_transmission_map, transmission_map_kwargs={}):
 
@@ -1933,7 +1942,7 @@ class SpaceConvolution:
 
         # Will eventually store these data in a more mutable format
         stpsf_options = dict(
-                pupi_shift_x = 0.0,
+                pupil_shift_x = 0.0,
                 pupil_shift_y = 0.0,
                 pupil_rotation = 0.0,
                 defocus_waves = 0.0
@@ -1979,6 +1988,29 @@ class SpaceConvolution:
         self._coron_tmaps_osamp = None
         self._psf_inds_osamp = None
         self._psfcube_off = None
+
+        # Select appropriate grid_fn, grid_inds_fn, and transmission_map_fn
+        # based on the observing configuration.
+        if grid_fn is None:
+            if 'FQPM' in self.image_mask:
+                from .miri_fqpm_fm import generate_fqpm_psf_grid
+                grid_fn = generate_fqpm_psf_grid
+            else:
+                grid_fn = generate_lyot_psf_grid
+
+        if transmission_map_fn is None:
+            if 'FQPM' in self.image_mask:
+                from .miri_fqpm_fm import get_fqpm_transmission_map
+                transmission_map_fn = get_fqpm_transmission_map
+            else:
+                transmission_map_fn = get_jwst_coron_transmission_map
+        
+        if grid_inds_fn is None:
+            if 'FQPM' in self.image_mask:
+                from .miri_fqpm_fm import get_fqpm_psf_grid_inds
+                grid_inds_fn = get_fqpm_psf_grid_inds
+            else:
+                grid_inds_fn = get_jwst_psf_grid_inds
 
         self.grid_fn = grid_fn
         self.grid_kwargs = grid_kwargs
@@ -2152,7 +2184,7 @@ class SpaceConvolution:
           should be used for convolution of that pixel. It should have the
           following signature:
                 grid_inds_fn(c_coron, psf_offsets_polar, osamp=2, shape=None,
-                pxscale=None, **grid_inds_kwargs)
+                pxscale=None, inst=None, **grid_inds_kwargs)
           See winnie.convolution.get_jwst_psf_grid_inds for documentation
           regarding these arguments.
 
@@ -2210,7 +2242,7 @@ class SpaceConvolution:
         if self.grid_inds_fn is not None:
             psf_inds_osamp = []
             for c_coron in self._c_coron_sci:
-                psf_inds = self.grid_inds_fn(c_coron, self.psf_offsets_polar, osamp=self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, **self.grid_inds_kwargs)
+                psf_inds = self.grid_inds_fn(c_coron, self.psf_offsets_polar, osamp=self.osamp, shape=(self._ny, self._nx), pxscale=self.pxscale, inst=self.inst_stpsf, **self.grid_inds_kwargs)
                 psf_inds_osamp.append(psf_inds)
             self._psf_inds_osamp = np.asarray(psf_inds_osamp)
         else:

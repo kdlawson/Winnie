@@ -14,21 +14,23 @@ dependencies = [
     "astropy",
     "joblib",
     "jwst",
+    "lmfit",
     "matplotlib",
     "numpy",
+    "photutils",
     "pyklip",
     "scipy",
     "scikit-learn",
     "spaceKLIP",
     "tqdm",
-    "photutils",
+    "vip_hci", 
     "stpsf",
     "webbpsf_ext",
     ]
 
 
 [project.optional-dependencies]
-tutorials = ["lmfit", "vip_hci", "synphot",]
+tutorials = ["synphot",]
 gpu = ["cupy",]   
 
 
@@ -47,3 +49,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
 write_to = "winnie/_version.py"
+
+
+[tool.setuptools.package-data]
+winnie = ["resources/*"]

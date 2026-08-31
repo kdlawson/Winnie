@@ -2,7 +2,14 @@
 
 Python package focusing on PSF-subtraction and forward modeling of circumstellar disks in high-contrast imaging data using reference star differential imaging (RDI). This initial release focuses on JWST coronagraphic observations and supports 1) RDI PSF-subtraction in various flavors, 2) disk model convolution using synthetic PSF grids, and 3) forward modeling for RDI.
 
-RDI PSF subtraction and forward modeling should work for any JWST coronagraphy. However, model convolution is only directly supported for JWST round mask data (for now) — so, excluding MIRI FQPM data and NIRCam bar mask data. For forward modeling of these data, you will need to provide one of a) your own PSF grid, b) PSF grid generation functions, or c) already-convolved models. See documentation for winnie.SpaceRDI.prepare_convolution and winnie.SpaceRDI.set_circumstellar_model for more information.
+RDI PSF subtraction and forward modeling should work for any JWST coronagraphy.
+However, model convolution is only directly supported for JWST round mask and
+MIRI 4QPM data
+(for now) — so, excludes NIRCam bar mask data. For forward
+modeling of these data, you will need to provide one of a) your own PSF grid,
+b) PSF grid generation functions, or c) already-convolved models. See
+documentation for winnie.SpaceRDI.prepare_convolution and
+winnie.SpaceRDI.set_circumstellar_model for more information.
 
 Open an issue if you have any problems or want to suggest new features.
 
@@ -100,9 +107,17 @@ reduc = wdb.run_rdi(save_products=True)  # Carry out a basic RDI reduction and s
 
 ### Tutorials:
 
-Included in the tutorials directory are some NIRCam observations of AU Mic and reference stars (GTO 1184; PI Josh Schlieder) for use with the [tutorial notebooks](https://github.com/kdlawson/Winnie/tree/main/tutorials).
+Included in the tutorials directory (for use with the [tutorial notebooks](https://github.com/kdlawson/Winnie/tree/main/tutorials):
 
-The first two tutorial notebooks provide examples for the main uses (with the second providing a full example for forward modeling). The last two tutorials can be considered more advanced, and you can probably skip them if you're either a) already very familiar with PSF subtraction / good at parsing code and docstrings, or b) not already familiar but just want to run the code without thinking too much about it.
+- NIRCam observations of AU Mic and reference stars (GTO 1184; PI Josh
+  Schlieder). Analysis of these data is reported in Lawson et al. (2023). These
+  data are featued in tutorials 1-6.
+
+- MIRI/4QPM observations of HD 106906 from GTO 1277 (PI: Pierre-Olivier Lagage)
+  with reference observations from GTO 1194 (PI: Chas Beichman). Analysis of
+  these data is reported in Rouan et al. (2025). These
+  data are featued in tutorial 7.
+
 
 ### Current limitations:
 
