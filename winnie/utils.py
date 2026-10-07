@@ -172,7 +172,17 @@ def median_combine(imcube, errcube=None):
         return im,None 
     n = np.sum(np.isfinite(imcube), axis=0)
     sig_mean = np.sqrt(np.nansum(errcube**2, axis=0))/n
-    err = np.sqrt(np.pi*(2*n+1)/(4*n)) * sig_mean
+    medsig_sfac = np.where(n<=2, 1, np.sqrt(np.pi*(2*n+1)/(4*n)))
+    err = medsig_sfac * sig_mean
+    return im,err
+
+
+def mean_combine(imcube, errcube=None):
+    im = np.nanmean(imcube, axis=0)
+    if errcube is None:
+        return im,None 
+    n = np.sum(np.isfinite(imcube), axis=0)
+    err = np.sqrt(np.nansum(errcube**2, axis=0))/n
     return im,err
 
 

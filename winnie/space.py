@@ -20,16 +20,13 @@ from .rdi import (rdi_residuals, build_annular_rdi_zones)
 
 from .plot import (mpl, plt, quick_implot, mpl_centered_extent)
 
-from .utils import (robust_mean_combine, median_combine,
-                    ang_size_to_px_size, px_size_to_ang_size,
+from .utils import (median_combine, ang_size_to_px_size, px_size_to_ang_size,
                     high_pass_filter_sequence, rotate_hypercube,
                     xy_polar_ang_displacement, rotate_image, gaussian_filter_sequence, crop_data,
                     c_to_c_osamp, pad_or_crop_image, dist_to_pt, compute_derot_padding, 
                     nan_median_absolute_deviation)
 
-from .convolution import (_AUTO_CONVOLUTION_MARGIN,
-                          _choose_spatial_psf_convolution_strategy, 
-                          _get_psf_patch_bounds,
+from .convolution import (_get_psf_patch_bounds,
                           convolve_with_spatial_psfs,
                           get_jwst_psf_grid_inds,
                           get_jwst_coron_transmission_map,
@@ -48,9 +45,10 @@ class SpaceRDI:
                  output_subdir='WinnieRDI', data_ext=None,
                  ncores=-1, use_gpu=False, verbose=True, show_plots=False,
                  overwrite=False, prop_err=True, show_progress=False,
-                 use_robust_mean=False, robust_clip_nsig=3, pad_data='auto', 
-                 pad_before_derot=False, r_opt=3*u.arcsec, r_sub=None,
-                 correct_distortion=True, 
+                 input_combine_fn=median_combine, input_combine_kws={}, 
+                 output_combine_fn=median_combine, output_combine_kws={}, 
+                 pad_data='auto', pad_before_derot=False, 
+                 r_opt=3*u.arcsec, r_sub=None, correct_distortion=True, 
                  save_coron_transmission=True, save_instance=False, 
                  distort_models=True, efficient_saving=True, from_fits=None):
         """
@@ -102,13 +100,26 @@ class SpaceRDI:
             usually unnecessary (and uninformative) for JWST data, where the
             small number of frames makes PSF subtraction very fast.
 
-        use_robust_mean: bool
-            If data are not already coadded, will combine integrations using a
-            sigma clipped mean rather than the median.
+        input_combine_fn: callable
+            Function to combine input integrations to a single image per exposure. 
+            Only used if inputs are not already coadded. Should
+            accept an image cube and an optional error cube, and return the
+            combined image and propagated error. See median_combine for an 
+            example implementation. Other built-in options are mean_combine 
+            and robust_mean_combine.
 
-        robust_clip_nsig: int or float
-            If use_robust_mean=True, the number of median absolute deviations
-            above or below the median for a value to be clipped.
+        input_combine_kws: dict
+            Keyword arguments to pass to input_combine_fn.
+
+        output_combine_fn: callable
+            Function to combine output images (e.g., derotated frames) to a single image. 
+            Should accept an image cube and an optional error cube, and return the
+            combined image and propagated error. See median_combine for an 
+            example implementation. Other built-in options are mean_combine 
+            and robust_mean_combine.
+
+        output_combine_kws: dict
+            Keyword arguments to pass to output_combine_fn.
 
         pad_data: int or str
             If pad_data is an int, pads the data (both science and reference)
@@ -191,8 +202,10 @@ class SpaceRDI:
             self.overwrite = overwrite
             self.show_progress = show_progress
             self.prop_err = prop_err
-            self.use_robust_mean = use_robust_mean
-            self.robust_clip_nsig = robust_clip_nsig
+            self.input_combine_fn = input_combine_fn
+            self.input_combine_kws = input_combine_kws
+            self.output_combine_fn = output_combine_fn
+            self.output_combine_kws = output_combine_kws
             self._imc_padding = None
             self.pad_data = pad_data
             if pad_before_derot:
@@ -290,10 +303,7 @@ class SpaceRDI:
                 else:
                     offset = coron_offsets[i]
             if np.ndim(ints.squeeze()) != 2:
-                if self.use_robust_mean:
-                    im, err = robust_mean_combine(ints, errs, self.robust_clip_nsig)
-                else: 
-                    im, err = median_combine(ints, errs)
+                im, err = self.input_combine_fn(ints, errs, **self.input_combine_kws)
             else:
                 im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
                     
@@ -577,7 +587,7 @@ class SpaceRDI:
         errcube = (None if errcube_in is None else errcube_in.copy())
         
         c_coron_out = self.c_coron_sci.copy()
-        
+
         if correct_distortion:
             for i, posang in enumerate(self._posangs_sci):
                 # If derotating, undistort_image will perform both derotation and distortion correction with a single interpolation.
@@ -617,7 +627,7 @@ class SpaceRDI:
                                             use_gpu = self.use_gpu, cval0=np.nan)
                 
         if derotate:
-            im_col, err_col = median_combine(imcube, errcube)
+            im_col, err_col = self.output_combine_fn(imcube, errcube, **self.output_combine_kws)
         else:        
             im_col, err_col = None, None
 
@@ -628,7 +638,7 @@ class SpaceRDI:
             for visit_id in uni_visit_ids:
                 visit = self._visit_ids_sci == visit_id
                 visit_err = (None if errcube is None else errcube[visit])
-                im_roll, err_roll = median_combine(imcube[visit], visit_err)
+                im_roll, err_roll = self.output_combine_fn(imcube[visit], visit_err, **self.output_combine_kws)
                 im_rolls.append(im_roll)
                 err_rolls.append(err_roll)
             im_rolls = np.asarray(im_rolls)
@@ -1714,16 +1724,22 @@ class SpaceRDI:
 
     def __setstate__(self, state):
         self.__dict__.update(state) # Restore attributes
+        if 'input_combine_fn' not in state:
+            self.input_combine_fn = median_combine
+        if 'input_combine_kws' not in state:
+            self.input_combine_kws = {}
+        if 'output_combine_fn' not in state:
+            self.output_combine_fn = median_combine
+        if 'output_combine_kws' not in state:
+            self.output_combine_kws = {}
+
         # Reload the data if efficient saving was used.
         if self.efficient_saving: 
             imcube_sci, errcube_sci = [],[]
             for f in self._files_sci:
                 ints, errs = fits.getdata(f, ext=1), (fits.getdata(f, ext=2) if self.prop_err else None)
                 if np.ndim(ints.squeeze()) != 2:
-                    if self.use_robust_mean:
-                        im, err = robust_mean_combine(ints, errs, self.robust_clip_nsig)
-                    else: 
-                        im, err = median_combine(ints, errs)
+                    im, err = self.input_combine_fn(ints, errs, **self.input_combine_kws)
                 else:
                     im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
                 imcube_sci.append(im)
@@ -1732,10 +1748,7 @@ class SpaceRDI:
             for f in self._files_ref:
                 ints, errs = fits.getdata(f, ext=1), (fits.getdata(f, ext=2) if self.prop_err else None)
                 if np.ndim(ints.squeeze()) != 2:
-                    if self.use_robust_mean:
-                        im, err = robust_mean_combine(ints, errs, self.robust_clip_nsig)
-                    else: 
-                        im, err = median_combine(ints, errs)
+                    im, err = self.input_combine_fn(ints, errs, **self.input_combine_kws)
                 else:
                     im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
                 imcube_ref.append(im)
