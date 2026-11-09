@@ -16,7 +16,7 @@ except ModuleNotFoundError:
     import webbpsf as stpsf
 import warnings
 
-from .rdi import (rdi_residuals, build_annular_rdi_zones)
+from .rdi import (rdi_residuals, build_annular_rdi_zones, _prepare_reference_matrices)
 
 from .plot import (mpl, plt, quick_implot, mpl_centered_extent)
 
@@ -272,6 +272,7 @@ class SpaceRDI:
         self._fwhm = np.hypot(self._instfwhm, self._blurfwhm)
         self._sigma = self._fwhm/np.sqrt(8.*np.log(2.))
         self.concat = concat_str
+        self._prepared_refmats = None
         
         imcube = []
         errcube = []
@@ -405,7 +406,7 @@ class SpaceRDI:
         - sets the cropped shape such that those separations are included in the FOV.
         """
 
-        if cropped_shape == 'auto':
+        if isinstance(cropped_shape, str) and cropped_shape == 'auto':
             rmax = np.max(dist_to_pt(self._c_star, nx=self._nx, ny=self._ny)[np.any(self._optzones, axis=0)])
             new_nx = new_ny = int(rmax*2 + auto_pad_nfwhm*self._fwhm)
             cropped_shape = [new_ny, new_nx]
@@ -453,9 +454,15 @@ class SpaceRDI:
             self.convolver.set_crop(cropped_shape)
 
 
-    def run_rdi(self, save_products=False, return_res_only=False,
-                forward_model=False, collapse_rolls=True, derotate=True,
+    def run_rdi(self, 
+                save_products=False,
+                return_res_only=False,
+                forward_model=False,
+                collapse_rolls=True,
+                derotate=True,
                 correct_distortion=None,
+                use_cached_refmats=True,
+                update_reference_cache=None,
                 **extra_rdi_settings):
         """
         Runs winnie.rdi.rdi_residuals using settings stored in the SpaceRDI
@@ -491,6 +498,19 @@ class SpaceRDI:
             If True, derotates the residuals to a common north up orientation.
             If False, returns residuals in the original orientation.
         
+        correct_distortion: bool or None
+            If True, applies distortion correction to the residuals. If False, 
+            no distortion correction is applied. If None, uses the default behavior 
+            specified in the SpaceRDI object.
+
+        use_cached_refmats: bool
+            If True, uses cached reference matrices if available. If False, 
+            reference matrices are computed on the fly in the RDI code.
+
+        update_reference_cache: bool or None
+            Whether to update the cached reference matrices. If None, cached 
+            reference matrices are updated unless forward_model=True.
+
         extra_rdi_settings:
             Additional settings to pass to winnie.rdi.rdi_residuals. If any of
             these is already contained in the rdi_settings attribute, an error
@@ -542,7 +562,18 @@ class SpaceRDI:
             err_hcube_ref = self.errcube_ref[:, np.newaxis]  
         else: 
             err_hcube = err_hcube_ref = None
-            
+    
+        if update_reference_cache is None: # By default: update the reference cache unless we're forward modeling
+            update_reference_cache = not forward_model
+
+        if update_reference_cache: # Build the reference cache
+            self._build_reference_cache(**self.rdi_settings, **extra_rdi_settings)
+
+        if use_cached_refmats:
+            prepared_refmats = self._prepared_refmats
+        else:
+            prepared_refmats = None
+
         res = rdi_residuals(hcube=imcube_sci[:, np.newaxis],
                             hcube_ref=self.imcube_ref[:, np.newaxis],
                             optzones=self.optzones, 
@@ -552,6 +583,7 @@ class SpaceRDI:
                             err_hcube=err_hcube,
                             err_hcube_ref=err_hcube_ref,
                             show_progress=self.show_progress,
+                            prepared_refmats=prepared_refmats,
                             **self.rdi_settings,
                             **extra_rdi_settings)
         
@@ -569,6 +601,18 @@ class SpaceRDI:
         
         return products
     
+
+    def _build_reference_cache(self, **settings):
+        hcube_ref = self.imcube_ref[:, np.newaxis].astype(np.float64)
+        if settings.get('opt_smoothing_fn') is not None:
+            hcube_ref_opt = settings['opt_smoothing_fn'](hcube_ref, **settings.get('opt_smoothing_kwargs', {}))
+        else:
+            hcube_ref_opt = hcube_ref
+        if settings.get('zero_nans', False):
+            hcube_ref_opt = np.nan_to_num(hcube_ref_opt)
+        
+        self._prepared_refmats = _prepare_reference_matrices(hcube_ref_opt, self.optzones, ref_mask=settings.get('ref_mask'))
+
 
     def imcube_to_products(self, imcube_in, errcube_in=None, derotate=True, correct_distortion=None, 
                             collapse_rolls=True, output_ext=None, reduc_label=None, save_products=False, 

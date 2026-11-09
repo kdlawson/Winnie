@@ -374,7 +374,7 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, ptsrc_hduls=None, err_weighting=Fal
         the fly for any point source parameters in p. Leaving as None during
         optimization will add an enormous amount of runtime.
     
-    err_weighting: bool
+    err_weighting: bool or numpy.ndarray
         If err_weighting is True, the array stored in rdi_reduc.err_rolls is
         used to weight the residuals. If an array of the same shape as
         rdi_reduc.rolls, then that array is used instead. If False, residuals
@@ -750,8 +750,7 @@ class EdgeOnSafeScatteredLightDisk(ScatteredLightDisk):
         halfNbSlices=25,
         min_star_distance_au=None,
         vertical_extent_factor=2.0,
-        lwidth=100.0,
-    ):
+        lwidth=100.0):
         """
         Compute the un-normalized scattered-light image at arbitrary projected
         sky/disk-frame coordinates.
@@ -810,9 +809,7 @@ class EdgeOnSafeScatteredLightDisk(ScatteredLightDisk):
             rstar = np.sqrt(xd**2 + yd**2)
             theta_star = np.arctan2(yd, xd)
 
-            cosphi = (
-                rstar * s * np.sin(theta_star) + zd * c
-            ) / dstar_safe
+            cosphi = (rstar * s * np.sin(theta_star) + zd * c) / dstar_safe
             cosphi = np.clip(cosphi, -1.0, 1.0)
 
             r_disk = np.sqrt((xd - self.xdo) ** 2 + (yd - self.ydo) ** 2)
@@ -820,14 +817,8 @@ class EdgeOnSafeScatteredLightDisk(ScatteredLightDisk):
             costheta = np.cos(theta_disk - omega_rad)
 
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                rho = self.dust_density.density_cylindrical(
-                    r_disk,
-                    costheta,
-                    zd,
-                )
-                phase = self.phase_function.compute_phase_function_from_cosphi(
-                    cosphi
-                )
+                rho = self.dust_density.density_cylindrical(r_disk, costheta, zd)
+                phase = self.phase_function.compute_phase_function_from_cosphi(cosphi)
                 cur = rho * phase / d2star_safe
 
             cur = np.nan_to_num(cur, nan=0.0, posinf=0.0, neginf=0.0)

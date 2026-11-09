@@ -7,15 +7,15 @@ from tqdm.auto import tqdm
 
 from .utils import (dist_to_pt, rotate_hypercube, pad_and_rotate_hypercube, free_gpu, ang_size_to_px_size, proj_sep_to_ang_size)
 
-def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask=None, show_progress=False, posangs=None, cent=None, 
+def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask=None, prepared_refmats=None, show_progress=False, posangs=None, cent=None, 
                   objective=False, zero_nans=False, use_gpu=False, ncores=-2, return_coeffs=False, coeffs_in=None, return_psf_model=False,
                   pad_before_derot=False, opt_smoothing_fn=None, opt_smoothing_kwargs={}, err_hcube=None, err_hcube_ref=None, large_arrs=False):
     """
     Performs RDI PSF subtraction using LOCI (Lafreniere et al. 2007). Using available keyword arguments, this function can be used to 
     perform:
 
-    a) Model Constrained RDI (MCRDI; Lawson et al. 2022) — by passing in a convolved model of the circumstellar scene (CSS) via hcube_css 
-    b) Polarimetry Constrained RDI (PCRDI; Lawson et al. 2022) — by passing a polarimetry-based total intensity estimate of the CSS via
+    a) Model Constrained RDI (MCRDI; Lawson et al. 2022) — by passing in a convolved model of the circumstellar scene (CSS) via hcube_css 
+    b) Polarimetry Constrained RDI (PCRDI; Lawson et al. 2022) — by passing a polarimetry-based total intensity estimate of the CSS via
        hcube_css
     c) RDI with high-pass filtering for coefficients — via opt_smoothing_fn and opt_smoothing_kwargs
     d) Greedy Disk Subtraction (GreeDS; Pairet et al. 2021) — by passing a previous iteration in via hcube_css
@@ -55,6 +55,12 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
             some reference exposures have anomalous features that make them problematic for some regions while still being
             suitable for others; e.g., an image with a bright background source near the edge of the FOV may still be useful
             for nulling the PSF near the inner working angle.
+
+        prepared_refmats: dict or None
+            Dictionary containing precomputed QR decompositions of the reference images. Should have the format:
+            {'Qs': [Q1, Q2, ...], 'Rs': [R1, R2, ...]}, where each Qi and Ri correspond to the QR decomposition
+            of the ith reference image block. If provided, these will be used instead of computing the QR decomposition
+            from scratch. See _prepare_reference_matrices for default implementation.
             
         show_progress: bool
             If True, a status bar will be displayed for the major components of PSF subtraction.
@@ -114,9 +120,9 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
             for synthetic reference images).
 
         large_arrs: bool
-            If True (and if use_gpu=False), PSF model reconstruction will use smaller parallelized calculations. If False,
-            larger vectorized calculations will be used instead. See the docstring for reconstruct_psf_model_cpu for more
-            information.
+            If True (and if use_gpu=False), PSF model reconstruction will use smaller parallelized calculations to accomodate
+            prohibitively large inputs. If False, larger vectorized calculations will be used instead. See the docstring for 
+            reconstruct_psf_model_cpu for more information.
 
     ________
     Returns:
@@ -136,16 +142,21 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
         hcube_sub = hcube - hcube_css
         
     if opt_smoothing_fn is not None:
-        hcube_opt, hcube_ref_opt = opt_smoothing_fn(hcube_sub, **opt_smoothing_kwargs), opt_smoothing_fn(hcube_ref, **opt_smoothing_kwargs)
+        hcube_opt = opt_smoothing_fn(hcube_sub, **opt_smoothing_kwargs)
+        if (prepared_refmats is None) or objective: # only create the filtered optimization refs when not passing in prepared_refmats
+            hcube_ref_opt = opt_smoothing_fn(hcube_ref, **opt_smoothing_kwargs)
+        else:
+            hcube_ref_opt = hcube_ref
     else:
-        hcube_opt, hcube_ref_opt = hcube_sub, hcube_ref
+        hcube_opt = hcube_sub
+        hcube_ref_opt = hcube_ref
 
     if zero_nans: 
         hcube_opt = np.nan_to_num(hcube_opt)
         hcube_ref_opt = np.nan_to_num(hcube_ref_opt)
     
     if coeffs_in is None:
-        coeffs = compute_rdi_coefficients(hcube_opt, hcube_ref_opt, optzones, show_progress=show_progress, ref_mask=ref_mask)
+        coeffs = compute_rdi_coefficients(hcube_opt, hcube_ref_opt, optzones, show_progress=show_progress, ref_mask=ref_mask, prepared_refmats=prepared_refmats)
     else:
         coeffs = coeffs_in
 
@@ -186,32 +197,38 @@ def rdi_residuals(hcube, hcube_ref, optzones, subzones, hcube_css=None, ref_mask
     return hcube_res, err_hcube_res, cent_out
 
 
-def compute_rdi_coefficients(hcube, hcube_ref, optzones, show_progress=False, ref_mask=None):
-    nT, nL, _, _ = hcube.shape  # N_theta by N_lambda by N_y by N_x
-    nT_ref = hcube_ref.shape[0]
-    nR = len(optzones) # N_regions
-    coeff_hcube = np.zeros((nR, nT, nT_ref, nL), dtype=hcube.dtype)  # Array for storing coefficients
-    R = tqdm(range(nR), desc='Coefficient calculation (regions)', leave=False) if show_progress else range(nR)
-    L = tqdm(range(nL), desc='Coefficient calculation (wavelengths)', leave=False) if (show_progress and nL>1) else range(nL)
-    T = tqdm(range(nT), desc='Coefficient calculation (exposures)', leave=False) if show_progress else range(nT)
-    for Ri in R:  # Outermost loop over subsections; this iteration order ends up being more time efficient here
-        opt_i = optzones[Ri]  # opt_i is the ny by nx boolean array indicating which pixels are in the region.
-        tararrs = hcube[..., opt_i].copy() # This turns our masked nT*nL*ny*nx array into an nT*nL*nP array, where nP is the number of pixels in the optimization region.
-        refarrs = hcube_ref[..., opt_i].copy()  # This turns our masked nT_ref*nL*ny*nx array into an nT_ref*nL*nP array, where nP is the number of pixels in the optimization region.
+def _prepare_reference_matrices(hcube_ref, optzones, ref_mask=None):
+    prepared_refmats = dict(Qs=[], Rs=[])
+    for Ri in range(len(optzones)):
+        opt_i = optzones[Ri]
+        refarrs = hcube_ref[..., opt_i].copy().transpose(1, 2, 0)
         if ref_mask is not None:
-            refarrs = refarrs[ref_mask[Ri]]
-        optmats = refarrs.transpose((1, 0, 2)) @ tararrs.transpose((1, 2, 0))# carries out matrix inversion of all wavelength channels at once, giving a matrix of shape (nL, nT_ref, nT)
-        refmats = refarrs.transpose((1, 0, 2)) @ refarrs.transpose((1, 2, 0))# carries out matrix inversion of all wavelength channels at once, giving a matrix of shape (nL, nT_ref, nT_ref)
-        for Li in L:  # Second loop over wavelengths
-            optmat = optmats[Li]  # The (nT_ref, nT) matrix for this wavelength
-            refmat = refmats[Li]  # The (nT_ref, nT_ref) matrix for this wavelength
-            lu, piv = linalg.lu_factor(refmat, check_finite=False)  # Since we aren't excluding frames as in ADI/SDI, we just need to run this once per wavelength.
-            for Ti in T:  # Final loop over integrations / exposures
-                tararr = optmat[:,Ti]  # 1d vector of length equal to nT_ref
-                if ref_mask is not None:
-                    coeff_hcube[Ri, Ti, ref_mask[Ri], Li] = linalg.lu_solve((lu, piv), tararr, check_finite=False) # Gets coefficients and places them into the appropriate positions in the coefficient array
-                else:
-                    coeff_hcube[Ri, Ti, :, Li] = linalg.lu_solve((lu, piv), tararr, check_finite=False) # Gets coefficients and places them into the appropriate positions in the coefficient array
+            refarrs = refarrs[..., ref_mask[Ri]]
+        Q, R = linalg.qr(refarrs, mode='economic', check_finite=False)
+        prepared_refmats['Qs'].append(Q)
+        prepared_refmats['Rs'].append(R)
+    return prepared_refmats
+
+
+def compute_rdi_coefficients(hcube, hcube_ref, optzones, show_progress=False, ref_mask=None, prepared_refmats=None):
+    nR = len(optzones)
+    coeff_hcube = np.zeros((nR, hcube.shape[0], hcube_ref.shape[0], hcube.shape[1]), dtype=hcube_ref.dtype)
+
+    if prepared_refmats is None:
+        prepared_refmats = _prepare_reference_matrices(hcube_ref, optzones, ref_mask=ref_mask)
+        
+    Riterator = (tqdm(range(nR), desc='Coefficient calculation (regions)', leave=False) if show_progress 
+                 else range(nR))
+
+    for Ri in Riterator:
+        opt_i = optzones[Ri]
+        tararrs = hcube[..., opt_i].copy().transpose(1, 2, 0)
+        Q, R = prepared_refmats['Qs'][Ri], prepared_refmats['Rs'][Ri]
+        coeffs = linalg.solve_triangular(R, Q.swapaxes(-2,-1) @ tararrs, check_finite=False).transpose(2,1,0)
+        if ref_mask is not None:
+            coeff_hcube[Ri][:, ref_mask[Ri], :] = coeffs
+        else:
+            coeff_hcube[Ri] = coeffs
     return coeff_hcube
 
 
