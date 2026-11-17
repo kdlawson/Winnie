@@ -10,11 +10,10 @@ os.environ.setdefault('STPSF_PATH', os.path.join(_data, 'stpsf-data'))
 os.environ.setdefault('WEBBPSF_EXT_PATH', os.path.join(_data, 'webbpsf_ext_data'))
 os.environ.setdefault('PYSYN_CDBS', os.path.join(os.environ['WEBBPSF_EXT_PATH'], 'cdbs'))
 
-# Synthetic RC observation; header layout loosely follows corgisim/corgidrp products.
+# Synthetic RC observation; header layout follows corgidrp L4 products.
 NY, NX = 61, 61
 PXSCALE = 0.0218  # arcsec/pixel
 STAR_XY = (30.0, 30.0)  # 0-based
-MASK_XY = (30.0, 30.0)
 PLANET_SEP_PX = 12.0
 PLANET_PA_DEG = 60.0  # east of north
 PLANET_CONTRAST = 0.05
@@ -53,19 +52,21 @@ def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False):
 
     h1 = fits.Header()
     h1['EXTNAME'] = 'SCI'
+    h1['DATALVL'] = 'L4'
+    h1['BUNIT'] = 'Photoelectrons / s'
     h1['STARLOCX'] = STAR_XY[0]
     h1['STARLOCY'] = STAR_XY[1]
-    h1['MASKLOCX'] = MASK_XY[0]
-    h1['MASKLOCY'] = MASK_XY[1]
     h1['PLTSCALE'] = PXSCALE * 1e3  # mas/pixel
     h1['CFAMNAME'] = '1F'
     h1['FPAMNAME'] = 'HLC12_C2R1'
     h1['LSAMNAME'] = 'NFOV'
-    h1['DATETIME'] = '2027-01-01T00:00:00'
+    h1['FTIMEUTC'] = '2027-01-01T00:00:00'
 
+    # Same extension layout as corgidrp.data.Image.save: SCI, ERR, DQ.
     fits.HDUList([fits.PrimaryHDU(header=h0),
                   fits.ImageHDU(sci, header=h1),
-                  fits.ImageHDU(err, name='ERR')]).writeto(path, overwrite=True)
+                  fits.ImageHDU(err, name='ERR'),
+                  fits.ImageHDU(np.zeros(sci.shape, dtype=np.uint8), name='DQ')]).writeto(path, overwrite=True)
 
 
 @pytest.fixture(scope='session')
