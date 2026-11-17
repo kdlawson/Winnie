@@ -20,6 +20,7 @@ PLANET_PA_DEG = 60.0  # east of north
 PLANET_CONTRAST = 0.05
 SCI_ROLLS = (-13.0, 13.0)
 NREF = 2
+REF_SCALE = 0.9  # REF star flux relative to SCI
 NINTS = 3
 
 
@@ -35,8 +36,8 @@ def planet_xy(roll):
     return STAR_XY[0] - PLANET_SEP_PX*np.sin(theta), STAR_XY[1] + PLANET_SEP_PX*np.cos(theta)
 
 
-def _write_rc_file(path, roll, psfref, visitid, planet, rng):
-    star = _gauss(*STAR_XY, fwhm=3.0) * (0.9 if psfref else 1.0)
+def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False):
+    star = _gauss(*STAR_XY, fwhm=3.0) * (REF_SCALE if psfref else 1.0)
     img = star + (_gauss(*planet_xy(roll), amp=PLANET_CONTRAST) if planet else 0)
     sci = np.array([img + rng.normal(0, 1e-4, img.shape) for _ in range(NINTS)], dtype=np.float32)
     err = np.full_like(sci, 1e-4)
@@ -75,10 +76,10 @@ def rc_fixture(tmp_path_factory):
     sci, ref = [], []
     for i, roll in enumerate(SCI_ROLLS):
         p = str(d / f'rc_sci_roll{i}.fits')
-        _write_rc_file(p, roll, False, f'000010010010010010{i}', True, rng)
+        _write_rc_file(p, roll, f'000010010010010010{i}', rng, psfref=False, planet=True)
         sci.append(p)
     for i in range(NREF):
         p = str(d / f'rc_ref_{i}.fits')
-        _write_rc_file(p, 0.0, True, f'000010010010020010{i}', False, rng)
+        _write_rc_file(p, 0.0, f'000010010010020010{i}', rng, psfref=True, planet=False)
         ref.append(p)
     return {'sci': sci, 'ref': ref, 'dir': str(d)}

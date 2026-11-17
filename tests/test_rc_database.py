@@ -29,15 +29,12 @@ def test_table_contents(db, rc_fixture):
         assert col in tab.colnames
     assert all(os.path.isabs(f) and os.path.isfile(f) for f in tab['FITSFILE'])
     assert tab['PIXSCALE'][0] == c.PXSCALE
-    assert tab['EXP_TYPE'][0] != 'NRC_CORON'
+    assert tab['EXP_TYPE'][0] == 'RC_CORON'
 
 
 def test_access_patterns(db):
     # SpaceRDI.load_concat accepts an int index or the concat name.
     assert list(db.obs.keys())[0] == 'RC_0'
-    # data_ext inference used in SpaceRDI.__init__ (space.py).
-    data_ext = db.obs[list(db.obs.keys())[0]]['FITSFILE'][0].split('_')[-1].removesuffix('.fits')
-    assert isinstance(data_ext, str)
 
 
 def test_multiple_concats(db, rc_fixture):

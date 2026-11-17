@@ -22,7 +22,7 @@ def test_fixture_planet_position(rc_fixture):
     # Planet should sit at the expected roll-dependent position in each SCI file.
     for f, roll in zip(rc_fixture['sci'], c.SCI_ROLLS):
         with fits.open(f) as hdul:
-            ref = fits.getdata(rc_fixture['ref'][0], 1)[0] / 0.9
+            ref = fits.getdata(rc_fixture['ref'][0], 1)[0] / c.REF_SCALE
             diff = hdul[1].data[0] - ref
         y, x = np.unravel_index(np.argmax(diff), diff.shape)
         xp, yp = c.planet_xy(roll)
