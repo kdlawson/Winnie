@@ -1,0 +1,84 @@
+import os
+
+import numpy as np
+import pytest
+from astropy.io import fits
+
+# winnie imports webbpsf_ext/stpsf at module level, which fail without these set.
+_data = os.path.expanduser('~/data')
+os.environ.setdefault('STPSF_PATH', os.path.join(_data, 'stpsf-data'))
+os.environ.setdefault('WEBBPSF_EXT_PATH', os.path.join(_data, 'webbpsf_ext_data'))
+os.environ.setdefault('PYSYN_CDBS', os.path.join(os.environ['WEBBPSF_EXT_PATH'], 'cdbs'))
+
+# Synthetic RC observation; header layout loosely follows corgisim/corgidrp products.
+NY, NX = 61, 61
+PXSCALE = 0.0218  # arcsec/pixel
+STAR_XY = (30.0, 30.0)  # 0-based
+MASK_XY = (30.0, 30.0)
+PLANET_SEP_PX = 12.0
+PLANET_PA_DEG = 60.0  # east of north
+PLANET_CONTRAST = 0.05
+SCI_ROLLS = (-13.0, 13.0)
+NREF = 2
+NINTS = 3
+
+
+def _gauss(x0, y0, fwhm=2.5, amp=1.0):
+    y, x = np.mgrid[:NY, :NX]
+    sig = fwhm / 2.3548
+    return amp * np.exp(-((x - x0)**2 + (y - y0)**2) / (2 * sig**2))
+
+
+def planet_xy(roll):
+    """Detector position of the planet for a given roll (PA_APER, deg)."""
+    theta = np.deg2rad(PLANET_PA_DEG - roll)
+    return STAR_XY[0] - PLANET_SEP_PX*np.sin(theta), STAR_XY[1] + PLANET_SEP_PX*np.cos(theta)
+
+
+def _write_rc_file(path, roll, psfref, visitid, planet, rng):
+    star = _gauss(*STAR_XY, fwhm=3.0) * (0.9 if psfref else 1.0)
+    img = star + (_gauss(*planet_xy(roll), amp=PLANET_CONTRAST) if planet else 0)
+    sci = np.array([img + rng.normal(0, 1e-4, img.shape) for _ in range(NINTS)], dtype=np.float32)
+    err = np.full_like(sci, 1e-4)
+
+    h0 = fits.Header()
+    h0['TELESCOP'] = 'ROMAN'
+    h0['INSTRUME'] = 'CGI'
+    h0['ORIGIN'] = 'CorgiSim'
+    h0['VISITID'] = visitid
+    h0['PSFREF'] = int(psfref)
+    h0['PA_APER'] = roll
+    h0['TARGET'] = 'REF' if psfref else 'SCI'
+
+    h1 = fits.Header()
+    h1['EXTNAME'] = 'SCI'
+    h1['STARLOCX'] = STAR_XY[0]
+    h1['STARLOCY'] = STAR_XY[1]
+    h1['MASKLOCX'] = MASK_XY[0]
+    h1['MASKLOCY'] = MASK_XY[1]
+    h1['PLTSCALE'] = PXSCALE * 1e3  # mas/pixel
+    h1['CFAMNAME'] = '1F'
+    h1['FPAMNAME'] = 'HLC12_C2R1'
+    h1['LSAMNAME'] = 'NFOV'
+    h1['DATETIME'] = '2027-01-01T00:00:00'
+
+    fits.HDUList([fits.PrimaryHDU(header=h0),
+                  fits.ImageHDU(sci, header=h1),
+                  fits.ImageHDU(err, name='ERR')]).writeto(path, overwrite=True)
+
+
+@pytest.fixture(scope='session')
+def rc_fixture(tmp_path_factory):
+    """Writes synthetic SCI (two rolls, with planet) and REF files; returns their paths."""
+    d = tmp_path_factory.mktemp('rc_data')
+    rng = np.random.default_rng(0)
+    sci, ref = [], []
+    for i, roll in enumerate(SCI_ROLLS):
+        p = str(d / f'rc_sci_roll{i}.fits')
+        _write_rc_file(p, roll, False, f'000010010010010010{i}', True, rng)
+        sci.append(p)
+    for i in range(NREF):
+        p = str(d / f'rc_ref_{i}.fits')
+        _write_rc_file(p, 0.0, True, f'000010010010020010{i}', False, rng)
+        ref.append(p)
+    return {'sci': sci, 'ref': ref, 'dir': str(d)}
