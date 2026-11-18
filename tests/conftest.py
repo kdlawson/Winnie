@@ -10,7 +10,7 @@ os.environ.setdefault('STPSF_PATH', os.path.join(_data, 'stpsf-data'))
 os.environ.setdefault('WEBBPSF_EXT_PATH', os.path.join(_data, 'webbpsf_ext_data'))
 os.environ.setdefault('PYSYN_CDBS', os.path.join(os.environ['WEBBPSF_EXT_PATH'], 'cdbs'))
 
-# Synthetic RC observation; header layout follows corgidrp L4 products.
+# Synthetic RC observation; header layout follows default corgidrp L3 products.
 NY, NX = 61, 61
 PXSCALE = 0.0218  # arcsec/pixel
 STAR_XY = (30.0, 30.0)  # 0-based
@@ -35,7 +35,7 @@ def planet_xy(roll):
     return STAR_XY[0] - PLANET_SEP_PX*np.sin(theta), STAR_XY[1] + PLANET_SEP_PX*np.cos(theta)
 
 
-def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False):
+def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc=True):
     star = _gauss(*STAR_XY, fwhm=3.0) * (REF_SCALE if psfref else 1.0)
     img = star + (_gauss(*planet_xy(roll), amp=PLANET_CONTRAST) if planet else 0)
     sci = np.array([img + rng.normal(0, 1e-4, img.shape) for _ in range(NINTS)], dtype=np.float32)
@@ -52,10 +52,16 @@ def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False):
 
     h1 = fits.Header()
     h1['EXTNAME'] = 'SCI'
-    h1['DATALVL'] = 'L4'
-    h1['BUNIT'] = 'Photoelectrons / s'
-    h1['STARLOCX'] = STAR_XY[0]
-    h1['STARLOCY'] = STAR_XY[1]
+    h1['DATALVL'] = 'L3'
+    h1['BUNIT'] = 'photoelectron/s'
+    h1['SATSPOTS'] = 0
+    h1['FSMPRFL'] = 'NFOV'
+    h1['EACQ_COL'] = STAR_XY[0]
+    h1['EACQ_ROW'] = STAR_XY[1]
+    # Default L3 has no STARLOCX/Y; starloc=True mimics a user-run corgidrp find_star.
+    if starloc:
+        h1['STARLOCX'] = STAR_XY[0]
+        h1['STARLOCY'] = STAR_XY[1]
     h1['PLTSCALE'] = PXSCALE * 1e3  # mas/pixel
     h1['CFAMNAME'] = '1F'
     h1['FPAMNAME'] = 'HLC12_C2R1'

@@ -25,6 +25,14 @@ def test_sci_fields(rc_fixture):
         assert info['date'] == '2027-01-01T00:00:00'
         assert info['visit'] == f'000010010010010010{i}'
         assert info['psfref'] is False
+        assert info['satspots'] is False
+
+
+def test_no_starloc(rc_fixture):
+    h0, h1 = _headers(rc_fixture['sci'][0])
+    del h1['STARLOCX'], h1['STARLOCY']
+    info = read_rc_header(h0, h1)
+    assert info['c_star'] is None and info['c_coron'] is None
 
 
 def test_ref_psfref(rc_fixture):
@@ -43,7 +51,6 @@ def test_errors(rc_fixture):
     h0, h1 = _headers(rc_fixture['sci'][0])
 
     h1_l1 = h1.copy()
-    del h1_l1['STARLOCX']
     h1_l1['DATALVL'] = 'L1'
     with pytest.raises(ValueError, match='L1'):
         read_rc_header(h0, h1_l1)
@@ -65,3 +72,5 @@ def test_database_from_headers(rc_fixture, tmp_path):
     tab = db.obs[name]
     assert np.isclose(tab['PIXSCALE'][0], c.PXSCALE)
     assert tab['CWAVEL'][0] == 0.575
+    assert np.allclose(tab['STARX'], c.STAR_XY[0])
+    assert np.allclose(tab['STARY'], c.STAR_XY[1])

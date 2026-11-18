@@ -24,13 +24,13 @@ def read_rc_header(h0, h1):
     Returns
     -------
     info: dict
-        Keys: posang (deg), c_star and c_coron (0-based x, y pixels), pxscale
-        (arcsec/pixel), wavel (microns), filter, mask, lyot, date, visit and
-        psfref.
+        Keys: posang (deg), c_star and c_coron (0-based x, y pixels; None if
+        STARLOCX/Y are absent, as in default L3 products), pxscale
+        (arcsec/pixel), wavel (microns), filter, mask, lyot, date, visit,
+        psfref and satspots.
     """
-    if 'STARLOCX' not in h1:
-        raise ValueError(f"No STARLOCX in header (DATALVL={h1.get('DATALVL')}); "
-                         "Winnie requires L3/L4 products from corgidrp.")
+    if h1.get('DATALVL') not in ('L3', 'L4'):
+        raise ValueError(f"DATALVL={h1.get('DATALVL')}; Winnie requires L3/L4 products from corgidrp.")
     if 'PA_APER' in h0:
         posang = h0['PA_APER']
     elif 'ROLL' in h0:
@@ -41,11 +41,11 @@ def read_rc_header(h0, h1):
     if band not in RC_CWAVEL:
         raise ValueError(f"Unknown CFAM band: {h1['CFAMNAME']}")
 
-    c_star = np.array([h1['STARLOCX'], h1['STARLOCY']], dtype=float)
+    c_star = np.array([h1['STARLOCX'], h1['STARLOCY']], dtype=float) if 'STARLOCX' in h1 else None
     return {'posang': float(posang),
             'c_star': c_star,
             # No separate FPM center keyword yet; corgidrp treats STARLOC as the FPM center.
-            'c_coron': c_star.copy(),
+            'c_coron': None if c_star is None else c_star.copy(),
             'pxscale': h1['PLTSCALE'] / 1000.,
             'wavel': RC_CWAVEL[band],
             'filter': h1['CFAMNAME'],
@@ -53,7 +53,35 @@ def read_rc_header(h0, h1):
             'lyot': h1['LSAMNAME'],
             'date': h1['FTIMEUTC'],
             'visit': h0['VISITID'],
-            'psfref': bool(h0['PSFREF'])}
+            'psfref': bool(h0['PSFREF']),
+            'satspots': bool(h1.get('SATSPOTS', 0))}
+
+
+def find_rc_star(files, **find_star_kws):
+    """
+    Locate the star in RC L3 frames with corgidrp's find_star, using the
+    satellite spot frames of the same visit. Input files are not modified.
+
+    Parameters
+    ----------
+    files: list of str
+        L3 files of a single visit: science frames (SATSPOTS=0) and the three
+        groups of satellite spot frames (SATSPOTS=1).
+
+    **find_star_kws:
+        Passed to corgidrp.l3_to_l4.find_star.
+
+    Returns
+    -------
+    c_stars: dict
+        0-based (x, y) star position for each science file.
+    """
+    from corgidrp import data, l3_to_l4
+
+    dataset = data.Dataset([os.path.abspath(f) for f in files])
+    out = l3_to_l4.find_star(dataset, **find_star_kws)
+    return {os.path.abspath(frame.filepath): np.array([frame.ext_hdr['STARLOCX'], frame.ext_hdr['STARLOCY']])
+            for frame in out}
 
 
 class RCDatabase:
@@ -73,10 +101,16 @@ class RCDatabase:
     def add_concat(self, sci_files, ref_files, pxscale=None, cwavel=None, concat=None,
                    blurfwhm=0.0, maskfile='NONE'):
         """
-        Add a concatenation of SCI and REF files to the database.
+        Add a concatenation of SCI and REF files to the database. Inputs are
+        default corgidrp L3 products; satellite spot frames (SATSPOTS=1) may be
+        included and are used only to locate the star (via find_rc_star) for
+        visits whose headers lack STARLOCX/Y.
 
         Parameters
         ----------
+        sci_files, ref_files: list of str
+            L3 files of the science and reference visits.
+
         pxscale: float
             Pixel scale in arcsec/pixel. If not provided, read from the header
             of the first SCI file.
@@ -93,25 +127,39 @@ class RCDatabase:
         concat: str
             Name of the added concatenation.
         """
-        if len(sci_files) == 0:
-            raise ValueError('At least one SCI file is required.')
-        files = [os.path.abspath(f) for f in [*sci_files, *ref_files]]
-        missing = [f for f in files if not os.path.isfile(f)]
+        all_files = [os.path.abspath(f) for f in [*sci_files, *ref_files]]
+        missing = [f for f in all_files if not os.path.isfile(f)]
         if missing:
             raise ValueError(f'Files not found: {missing}')
         if concat is None:
             concat = f'RC_{len(self.obs)}'
         if concat in self.obs:
             raise ValueError(f'Concatenation {concat} already exists.')
-        if pxscale is None or cwavel is None:
-            info = read_rc_header(fits.getheader(files[0], 0), fits.getheader(files[0], 1))
-            pxscale = info['pxscale'] if pxscale is None else pxscale
-            cwavel = info['wavel'] if cwavel is None else cwavel
+
+        infos = {f: read_rc_header(fits.getheader(f, 0), fits.getheader(f, 1)) for f in all_files}
+        sci = [f for f in all_files[:len(sci_files)] if not infos[f]['satspots']]
+        ref = [f for f in all_files[len(sci_files):] if not infos[f]['satspots']]
+        if len(sci) == 0:
+            raise ValueError('At least one SCI file (SATSPOTS=0) is required.')
+        files = sci + ref
+
+        c_stars = {f: infos[f]['c_star'] for f in files if infos[f]['c_star'] is not None}
+        for visit in sorted({infos[f]['visit'] for f in files if f not in c_stars}):
+            visit_files = [f for f in all_files if infos[f]['visit'] == visit]
+            if not any(infos[f]['satspots'] for f in visit_files):
+                raise ValueError(f'Visit {visit} has no STARLOCX/Y and no satellite spot frames to locate the star.')
+            c_stars.update(find_rc_star(visit_files))
+
+        info = infos[sci[0]]
+        pxscale = info['pxscale'] if pxscale is None else pxscale
+        cwavel = info['wavel'] if cwavel is None else cwavel
 
         n = len(files)
         tab = Table()
-        tab['TYPE'] = ['SCI']*len(sci_files) + ['REF']*len(ref_files)
+        tab['TYPE'] = ['SCI']*len(sci) + ['REF']*len(ref)
         tab['FITSFILE'] = np.array(files, dtype=object)
+        tab['STARX'] = np.array([c_stars[f][0] for f in files], dtype=float)
+        tab['STARY'] = np.array([c_stars[f][1] for f in files], dtype=float)
         tab['PIXSCALE'] = np.full(n, pxscale, dtype=float)
         tab['CWAVEL'] = np.full(n, cwavel, dtype=float)
         tab['BLURFWHM'] = np.full(n, blurfwhm, dtype=float)
