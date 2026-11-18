@@ -1,11 +1,17 @@
+import numbers
 import os
 
+import astropy.units as u
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 
+from .space import SpaceRDI
+from .utils import ang_size_to_px_size, pad_or_crop_image
+
 # Band reference wavelengths (microns) from cgisim; sub-bands (e.g. 1A) map to their band.
 RC_CWAVEL = {'1': 0.575, '2': 0.660, '3': 0.730, '4': 0.825}
+RC_DIAMETER = 2.36*u.meter
 
 
 def read_rc_header(h0, h1):
@@ -168,3 +174,136 @@ class RCDatabase:
         tab['MASKFILE'] = np.array([maskfile]*n, dtype=object)
         self.obs[concat] = tab
         return concat
+
+
+class RCRDI(SpaceRDI):
+    """
+    SpaceRDI for Roman Coronagraph (RC) data, built from an RCDatabase of
+    corgidrp L3 products. Distortion correction and coronagraph transmission
+    maps are off by default, since they rely on JWST-only tools (pysiaf,
+    webbpsf_ext).
+    """
+
+    def __init__(self, database=None, data_ext=None, correct_distortion=False, distort_models=False,
+                 save_coron_transmission=False, **kwargs):
+        if data_ext is None and kwargs.get('from_fits') is None:
+            # corgidrp names end in '_l3_.fits', so take the last non-empty token.
+            f = database.obs[list(database.obs.keys())[0]]['FITSFILE'][0]
+            data_ext = [t for t in os.path.basename(f).removesuffix('.fits').split('_') if t][-1]
+        super().__init__(database=database, data_ext=data_ext, correct_distortion=correct_distortion,
+                         distort_models=distort_models, save_coron_transmission=save_coron_transmission,
+                         **kwargs)
+
+    def load_concat(self, concat, cropped_shape=None, align=True):
+        """
+        Load data for an indicated concatenation in preparation for an RDI
+        reduction.
+
+        Parameters
+        ----------
+        concat: str or int
+            Either the full concatenation string or the index of the desired
+            concatenation.
+
+        cropped_shape: array or tuple
+            Spatial dimensions to which data should be cropped, as [ny,nx].
+
+        align: bool
+            If True, shifts every SCI and REF frame (and its error) so that its
+            star (STARX/STARY in the database) lands on the star of the first
+            SCI frame, as spaceKLIP's align_frames does for JWST data. If
+            False, frames are used as-is and the star of the first SCI frame is
+            assumed for all of them.
+        """
+        if isinstance(concat, numbers.Number):
+            concat_str = list(self.database.obs.keys())[concat]
+        else:
+            concat_str = concat
+
+        db_tab = self.database.obs[concat_str]
+        sci = np.asarray(db_tab['TYPE'] == 'SCI')
+        ref = np.asarray(db_tab['TYPE'] == 'REF')
+        files = np.array(db_tab['FITSFILE'])
+        c_stars = np.array([db_tab['STARX'], db_tab['STARY']], dtype=float).T
+
+        self.pxscale = db_tab[0]['PIXSCALE']*u.arcsec/u.pixel
+        self._lam = db_tab['CWAVEL'][0]*u.micron
+        self._blurfwhm = np.nan_to_num(db_tab['BLURFWHM'][0])
+        self._d_eff = RC_DIAMETER
+        self._instfwhm = ang_size_to_px_size(np.rad2deg((self._lam/(self._d_eff.to(u.micron))).value)*u.deg, self.pxscale).value
+        self._fwhm = np.hypot(self._instfwhm, self._blurfwhm)
+        self._sigma = self._fwhm/np.sqrt(8.*np.log(2.))
+        self.concat = concat_str
+        self._prepared_refmats = None
+
+        self._c_star = c_stars[np.argmax(sci)].copy()
+        if not align and np.max(np.hypot(*(c_stars - self._c_star).T)) > 0.1:
+            print('WARNING: star centers differ by more than 0.1 px between frames and align=False.')
+
+        imcube, errcube, posangs, visit_ids, dates, c_coron = [], [], [], [], [], []
+        for f, c_star_i in zip(files, c_stars):
+            with fits.open(f) as hdul:
+                ints = hdul[1].data.astype(float)
+                errs = hdul['ERR'].data.astype(float) if self.prop_err else None
+                dq = hdul['DQ'].data
+                info = read_rc_header(hdul[0].header, hdul[1].header)
+            if np.ndim(ints.squeeze()) != 2:
+                im, err = self.input_combine_fn(ints, errs, **self.input_combine_kws)
+            else:
+                im, err = ints.squeeze(), (None if not self.prop_err else errs.squeeze())
+            # Flagged pixels become NaN, as corgidrp's replace_bad_pixels does before interpolating.
+            bad = dq.squeeze() if np.ndim(dq.squeeze()) == 2 else np.any(dq, axis=0)
+            im = np.where(bad > 0, np.nan, im)
+            err = None if err is None else np.where(bad > 0, np.nan, err)
+            if align:
+                im = pad_or_crop_image(im, im.shape, cent=c_star_i, new_cent=self._c_star)
+                err = None if err is None else pad_or_crop_image(err, err.shape, cent=c_star_i, new_cent=self._c_star)
+                c_coron.append(self._c_star.copy())
+            else:
+                # No FPM-center keyword in L3; corgidrp treats the star as the FPM center.
+                c_coron.append(c_star_i)
+            imcube.append(im)
+            errcube.append(err)
+            posangs.append(info['posang'])
+            visit_ids.append(info['visit'])
+            dates.append(info['date'])
+
+        c_coron = np.array(c_coron)
+        self._coron_offsets = self._c_star - c_coron
+        self._image_mask = info['mask']
+        self._pupil_mask = info['lyot']
+        self._aperturename = None
+        self._instrument = db_tab[0]['INSTRUME']
+        self.filt = info['filter']
+
+        self._imcube_sci = np.array(imcube)[sci]
+        self._errcube_sci = np.array(errcube)[sci] if self.prop_err else None
+        self._posangs_sci = np.array(posangs)[sci]
+        self._visit_ids_sci = np.array(visit_ids)[sci]
+        self._c_coron_sci = c_coron[sci]
+        self._dates_sci = np.array(dates)[sci]
+        self._files_sci = files[sci]
+
+        self._imcube_ref = np.array(imcube)[ref]
+        self._errcube_ref = np.array(errcube)[ref] if self.prop_err else None
+        self._posangs_ref = np.array(posangs)[ref]
+        self._visit_ids_ref = np.array(visit_ids)[ref]
+        self._c_coron_ref = c_coron[ref]
+        self._dates_ref = np.array(dates)[ref]
+        self._files_ref = files[ref]
+
+        self._ny, self._nx = self._imcube_sci.shape[-2:]
+
+        if self.pad_data is not None: self._apply_padding()
+
+        self._imcube_css = None
+        self.cropped_shape = cropped_shape
+        self.rdi_settings = {}
+        self.fixed_rdi_settings = {}
+        self.update_annular_zones(exclude_opt_nans=True)
+        self.set_crop(cropped_shape)
+        self.rdi_presets()
+        self.siaf_aper = None
+
+        if self.convolver is not None:
+            self.convolver.load_concat(self.concat, **self.convolver_args)

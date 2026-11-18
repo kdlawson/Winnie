@@ -3,3 +3,4 @@ from . import rdi
 from . import utils
 from . import convolution
 from . import plot
+from .roman import RCRDI, RCDatabase

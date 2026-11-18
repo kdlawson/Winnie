@@ -14,7 +14,7 @@ def test_sci_fields(rc_fixture):
     for i, (f, roll) in enumerate(zip(rc_fixture['sci'], c.SCI_ROLLS)):
         info = read_rc_header(*_headers(f))
         assert info['posang'] == roll
-        assert np.allclose(info['c_star'], c.STAR_XY)
+        assert np.allclose(info['c_star'], rc_fixture['star_xy'][f])
         assert np.allclose(info['c_coron'], info['c_star'])
         assert info['c_coron'] is not info['c_star']
         assert np.isclose(info['pxscale'], c.PXSCALE)
@@ -72,5 +72,6 @@ def test_database_from_headers(rc_fixture, tmp_path):
     tab = db.obs[name]
     assert np.isclose(tab['PIXSCALE'][0], c.PXSCALE)
     assert tab['CWAVEL'][0] == 0.575
-    assert np.allclose(tab['STARX'], c.STAR_XY[0])
-    assert np.allclose(tab['STARY'], c.STAR_XY[1])
+    truth = np.array([rc_fixture['star_xy'][f] for f in tab['FITSFILE']])
+    assert np.allclose(tab['STARX'], truth[:, 0])
+    assert np.allclose(tab['STARY'], truth[:, 1])

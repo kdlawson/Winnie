@@ -20,7 +20,10 @@ PLANET_CONTRAST = 0.05
 SCI_ROLLS = (-13.0, 13.0)
 NREF = 2
 REF_SCALE = 0.9  # REF star flux relative to SCI
-NINTS = 3
+# Per-frame star offsets (px) from STAR_XY, as find_star reports on unregistered L3 frames.
+SCI_OFFSETS = ((0.0, 0.0), (0.3, -0.2))
+REF_OFFSETS = ((-0.25, 0.15), (0.1, 0.35))
+BAD_PIXEL = (45, 10)  # (y, x) flagged in DQ of the second REF file
 
 
 def _gauss(x0, y0, fwhm=2.5, amp=1.0):
@@ -29,17 +32,22 @@ def _gauss(x0, y0, fwhm=2.5, amp=1.0):
     return amp * np.exp(-((x - x0)**2 + (y - y0)**2) / (2 * sig**2))
 
 
-def planet_xy(roll):
+def planet_xy(roll, star_xy=STAR_XY):
     """Detector position of the planet for a given roll (PA_APER, deg)."""
     theta = np.deg2rad(PLANET_PA_DEG - roll)
-    return STAR_XY[0] - PLANET_SEP_PX*np.sin(theta), STAR_XY[1] + PLANET_SEP_PX*np.cos(theta)
+    return star_xy[0] - PLANET_SEP_PX*np.sin(theta), star_xy[1] + PLANET_SEP_PX*np.cos(theta)
 
 
-def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc=True):
-    star = _gauss(*STAR_XY, fwhm=3.0) * (REF_SCALE if psfref else 1.0)
-    img = star + (_gauss(*planet_xy(roll), amp=PLANET_CONTRAST) if planet else 0)
-    sci = np.array([img + rng.normal(0, 1e-4, img.shape) for _ in range(NINTS)], dtype=np.float32)
-    err = np.full_like(sci, 1e-4)
+def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc=True,
+                   star_xy=STAR_XY, bad_pixel=None):
+    star = _gauss(*star_xy, fwhm=3.0) * (REF_SCALE if psfref else 1.0)
+    img = star + (_gauss(*planet_xy(roll, star_xy), amp=PLANET_CONTRAST) if planet else 0)
+    sci = (img + rng.normal(0, 1e-4, img.shape)).astype(np.float32)
+    err = np.full((1, NY, NX), 1e-4, dtype=np.float32)
+    dq = np.zeros((NY, NX), dtype=np.uint16)
+    if bad_pixel is not None:
+        sci[bad_pixel] = 1e3
+        dq[bad_pixel] = 1
 
     h0 = fits.Header()
     h0['TELESCOP'] = 'ROMAN'
@@ -60,33 +68,39 @@ def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc
     h1['EACQ_ROW'] = STAR_XY[1]
     # Default L3 has no STARLOCX/Y; starloc=True mimics a user-run corgidrp find_star.
     if starloc:
-        h1['STARLOCX'] = STAR_XY[0]
-        h1['STARLOCY'] = STAR_XY[1]
+        h1['STARLOCX'] = star_xy[0]
+        h1['STARLOCY'] = star_xy[1]
     h1['PLTSCALE'] = PXSCALE * 1e3  # mas/pixel
     h1['CFAMNAME'] = '1F'
     h1['FPAMNAME'] = 'HLC12_C2R1'
     h1['LSAMNAME'] = 'NFOV'
     h1['FTIMEUTC'] = '2027-01-01T00:00:00'
 
-    # Same extension layout as corgidrp.data.Image.save: SCI, ERR, DQ.
+    # Same extension layout and shapes as corgidrp L3: SCI (ny, nx), ERR (1, ny, nx), DQ (ny, nx).
     fits.HDUList([fits.PrimaryHDU(header=h0),
                   fits.ImageHDU(sci, header=h1),
                   fits.ImageHDU(err, name='ERR'),
-                  fits.ImageHDU(np.zeros(sci.shape, dtype=np.uint8), name='DQ')]).writeto(path, overwrite=True)
+                  fits.ImageHDU(dq, name='DQ')]).writeto(path, overwrite=True)
 
 
 @pytest.fixture(scope='session')
 def rc_fixture(tmp_path_factory):
-    """Writes synthetic SCI (two rolls, with planet) and REF files; returns their paths."""
+    """
+    Writes synthetic SCI (two rolls, with planet) and REF files, one frame
+    per visit; returns their paths and true star positions.
+    """
     d = tmp_path_factory.mktemp('rc_data')
     rng = np.random.default_rng(0)
-    sci, ref = [], []
+    sci, ref, star_xy = [], [], {}
     for i, roll in enumerate(SCI_ROLLS):
         p = str(d / f'rc_sci_roll{i}.fits')
-        _write_rc_file(p, roll, f'000010010010010010{i}', rng, psfref=False, planet=True)
+        star_xy[p] = np.add(STAR_XY, SCI_OFFSETS[i])
+        _write_rc_file(p, roll, f'000010010010010010{i}', rng, psfref=False, planet=True, star_xy=star_xy[p])
         sci.append(p)
     for i in range(NREF):
         p = str(d / f'rc_ref_{i}.fits')
-        _write_rc_file(p, 0.0, f'000010010010020010{i}', rng, psfref=True, planet=False)
+        star_xy[p] = np.add(STAR_XY, REF_OFFSETS[i])
+        _write_rc_file(p, 0.0, f'000010010010020010{i}', rng, psfref=True, planet=False, star_xy=star_xy[p],
+                       bad_pixel=BAD_PIXEL if i == NREF - 1 else None)
         ref.append(p)
-    return {'sci': sci, 'ref': ref, 'dir': str(d)}
+    return {'sci': sci, 'ref': ref, 'star_xy': star_xy, 'dir': str(d)}
