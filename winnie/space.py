@@ -363,7 +363,7 @@ class SpaceRDI:
             self.siaf_aper = siaf_aper
 
         if self.convolver is not None:
-            self.convolver.load_concat(self.concat, **self.convolver_args)
+            self._load_convolver()
 
         if self.save_coron_transmission:
             outfile = self.output_dir + self.concat + '_psfmask.fits'
@@ -1103,7 +1103,7 @@ class SpaceRDI:
         if self.convolver is None or convolver_args != self.convolver_args: # If the convolver is not already set up or the args have changed
             if convolver_basedir is None:
                 convolver_basedir = self.output_dir
-            self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
+            self.convolver = getattr(self, 'convolution_class', SpaceConvolution)(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
                                               pad_data=self.pad_data, efficient_saving=self.efficient_saving, convolution_method=convolution_method,
@@ -1111,7 +1111,11 @@ class SpaceRDI:
             self.convolver_args = convolver_args
 
         if self.concat != self.convolver.concat:
-            self.convolver.load_concat(self.concat, cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets, **self.convolver_args)
+            self._load_convolver(cropped_shape=self.cropped_shape, coron_offsets=self._coron_offsets)
+
+
+    def _load_convolver(self, **kwargs):
+        self.convolver.load_concat(self.concat, **kwargs, **self.convolver_args)
 
     
     def set_circumstellar_model(self, model_cube=None, model_files=None, model_dir=None, model_ext='cssmodel',

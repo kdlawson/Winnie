@@ -8,7 +8,8 @@ from astropy.io import fits
 from astropy.table import Table
 from pyklip.klip import _rotate_wcs_hdr
 
-from .space import SpaceRDI, SpaceReduction
+from .convolution import get_jwst_psf_grid_inds
+from .space import SpaceConvolution, SpaceRDI, SpaceReduction
 from .utils import ang_size_to_px_size, pad_or_crop_image
 
 # Band reference wavelengths (microns) from cgisim; sub-bands (e.g. 1A) map to their band.
@@ -224,6 +225,151 @@ class RCReduction(SpaceReduction):
             self.primary_header['DEROT'] = True
 
 
+class RCInstrument:
+    """
+    Instrument setup handed to RC PSF grid and transmission functions, in
+    place of the stpsf/webbpsf_ext instruments used for JWST.
+    """
+
+    def __init__(self, pxscale, wavel, mask=None, lyot=None, filt=None):
+        self.pxscale = pxscale << u.arcsec/u.pixel
+        self.wavel = wavel << u.micron
+        self.mask = mask
+        self.lyot = lyot
+        self.filt = filt
+
+    @property
+    def lamd(self):
+        """lambda/D in arcsec."""
+        return np.rad2deg((self.wavel/RC_DIAMETER.to(u.micron)).value)*3600
+
+
+def gaussian_psf_grid(inst, source_spectrum=None, shift=None, osamp=2, fov_pixels=151, show_progress=True,
+                      fwhm=None, rvals_lamd=(0, 2, 4, 6, 8, 10, 12), ntheta=8):
+    """
+    Synthetic PSF grid of identical Gaussians, for testing RC convolution
+    before corgisim grids exist. Follows the grid_fn convention of
+    SpaceConvolution.fetch_psf_grid.
+
+    Parameters
+    ----------
+    inst: RCInstrument
+    fwhm: float
+        Gaussian FWHM in detector pixels. Default is lambda/D.
+    rvals_lamd: sequence
+        Sample separations from the mask center, in lambda/D; r=0 gets a
+        single sample.
+    ntheta: int
+        Number of position angles per nonzero separation.
+
+    Returns
+    -------
+    psfs, psfs, offsets_polar, offsets_xy
+        PSFs (odd side, each summing to 1) twice (RC has no distortion, so
+        "distorted" and "undistorted" are the same), offsets as [r (arcsec),
+        theta (deg, CCW from +Y)] and as [x, y] (arcsec), each of shape (2, N).
+    """
+    if fwhm is None:
+        fwhm = inst.lamd/inst.pxscale.value
+    n = fov_pixels*osamp + (fov_pixels*osamp + 1) % 2
+    y, x = np.indices((n, n)) - (n - 1)/2
+    sig = fwhm*osamp/np.sqrt(8*np.log(2))
+    psf = np.exp(-(x**2 + y**2)/(2*sig**2))
+    psf = (psf/psf.sum()).astype(np.float32)
+    rvals = np.asarray(rvals_lamd, dtype=float)*inst.lamd
+    thetas = np.arange(ntheta)*360./ntheta
+    r, theta = np.array([(rv, th) for rv in rvals for th in (thetas if rv > 0 else [0.])]).T
+    offsets_polar = np.array([r, theta])
+    offsets_xy = np.array([-r*np.sin(np.deg2rad(theta)), r*np.cos(np.deg2rad(theta))])
+    psfs = np.repeat(psf[np.newaxis], len(r), axis=0)
+    return psfs, psfs, offsets_polar, offsets_xy
+
+
+class RCConvolution(SpaceConvolution):
+    """
+    SpaceConvolution for RC data. The image geometry (rolls, star and mask
+    centers, shape) comes from the RCRDI instance, since RC images are aligned,
+    combined per visit and padded on load. The PSF grid and transmission
+    functions receive an RCInstrument instead of stpsf/webbpsf_ext objects.
+    """
+
+    @property
+    def inst_stpsf(self):
+        return self._rc_inst
+
+    @property
+    def inst_webbpsfext(self):
+        return self._rc_inst
+
+    def calc_psf_shift(self, *args, **kwargs):
+        self._psf_shift = None
+
+    def __getstate__(self):
+        # Always pickle the grid: refetching on unpickle would lose a custom grid.
+        efficient_saving, self.efficient_saving = self.efficient_saving, False
+        state = super().__getstate__()
+        self.efficient_saving = efficient_saving
+        return state
+
+    def load_concat(self, concat, posangs, c_coron, c_star, shape, pxscale, wavel, blurfwhm=0., mask=None,
+                    lyot=None, filt=None, fov_pixels=151, osamp=2, output_ext='psfs', prefetch_psf_grid=True,
+                    recalc_psf_grid=False, cropped_shape=None, grid_fn=None, grid_kwargs={}, grid_inds_fn=None,
+                    grid_inds_kwargs={}, transmission_map_fn=None, transmission_map_kwargs={}, **kwargs):
+        """
+        Set up convolution for the SCI images of an RCRDI concatenation.
+
+        Parameters
+        ----------
+        posangs, c_coron: arrays
+            Roll (deg) and mask center ([x, y]) per SCI image.
+        c_star, shape: arrays
+            Star position ([x, y]) and [ny, nx] of the (padded, uncropped) images.
+        grid_fn: callable
+            PSF grid function, called as grid_fn(RCInstrument, source_spectrum=,
+            shift=, osamp=, fov_pixels=, show_progress=, **grid_kwargs). Default
+            is gaussian_psf_grid.
+        transmission_map_fn: callable
+            Called as transmission_map_fn(RCInstrument, c_coron, osamp=, shape=,
+            **transmission_map_kwargs). Default (None) is a flat map of ones.
+
+        Other keywords (e.g. JWST-only reference_index, coron_offsets) are ignored.
+        """
+        if isinstance(concat, numbers.Number):
+            concat = list(self.database.obs.keys())[concat]
+        self.concat = concat
+        self.osamp = int(osamp)
+        self.fov_pixels = int(fov_pixels)
+        self.pxscale = pxscale << u.arcsec/u.pixel
+        self.blurfwhm = blurfwhm
+        self.blursigma = blurfwhm/np.sqrt(8.*np.log(2.))
+        self._rc_inst = RCInstrument(self.pxscale, wavel, mask=mask, lyot=lyot, filt=filt)
+        self.posangs_sci = np.asarray(posangs)
+        self._c_coron_sci = np.array(c_coron, dtype=float)
+        self._c_coron_ref = np.empty((0, 2))
+        self._c_star = np.array(c_star, dtype=float)
+        self._ny, self._nx = shape
+
+        self._psf_file_dist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}.fits'
+        self._psf_file_nodist = f'{self.output_dir}{concat}_fov{self.fov_pixels}_os{self.osamp}_{output_ext}_nodist.fits'
+        self.psf_file = self._psf_file_nodist
+        self._psf_shift = None
+        self._coron_tmaps_osamp = None
+        self._psf_inds_osamp = None
+
+        self.grid_fn = gaussian_psf_grid if grid_fn is None else grid_fn
+        self.grid_kwargs = grid_kwargs
+        self.grid_inds_fn = get_jwst_psf_grid_inds if grid_inds_fn is None else grid_inds_fn
+        self.grid_inds_kwargs = grid_inds_kwargs
+        self.transmission_map_fn = transmission_map_fn
+        self.transmission_map_kwargs = transmission_map_kwargs
+
+        self.cropped_shape = cropped_shape
+        if prefetch_psf_grid:
+            self.fetch_psf_grid(recalc_psf_grid=recalc_psf_grid)
+        else:
+            self._grid_fetched = False
+
+
 class RCRDI(SpaceRDI):
     """
     SpaceRDI for Roman Coronagraph (RC) data, built from an RCDatabase of
@@ -232,6 +378,7 @@ class RCRDI(SpaceRDI):
     webbpsf_ext).
     """
     reduction_class = RCReduction
+    convolution_class = RCConvolution
 
     def __init__(self, database=None, data_ext=None, correct_distortion=False, distort_models=False,
                  save_coron_transmission=False, **kwargs):
@@ -249,6 +396,13 @@ class RCRDI(SpaceRDI):
         state = super().__getstate__()
         self.efficient_saving = efficient_saving
         return state
+
+    def _load_convolver(self, **kwargs):
+        kwargs = {**kwargs, 'cropped_shape': self.cropped_shape}
+        self.convolver.load_concat(self.concat, posangs=self._posangs_sci, c_coron=self._c_coron_sci,
+                                   c_star=self._c_star, shape=(self._ny, self._nx), pxscale=self.pxscale,
+                                   wavel=self._lam, blurfwhm=self._blurfwhm, mask=self._image_mask,
+                                   lyot=self._pupil_mask, filt=self.filt, **kwargs, **self.convolver_args)
 
     def _save_products(self, products, include_instance=False, add_output_to_db=False):
         super()._save_products(products, include_instance=include_instance, add_output_to_db=False)
@@ -386,4 +540,4 @@ class RCRDI(SpaceRDI):
         self.siaf_aper = None
 
         if self.convolver is not None:
-            self.convolver.load_concat(self.concat, **self.convolver_args)
+            self._load_convolver()
