@@ -255,7 +255,7 @@ class RCRDI(SpaceRDI):
         if add_output_to_db:
             self.database.add_product(self.concat, products.filename)
 
-    def load_concat(self, concat, cropped_shape=None, align=True):
+    def load_concat(self, concat, cropped_shape=None, align=True, combine_frames=True):
         """
         Load data for an indicated concatenation in preparation for an RDI
         reduction.
@@ -275,6 +275,13 @@ class RCRDI(SpaceRDI):
             SCI frame, as spaceKLIP's align_frames does for JWST data. If
             False, frames are used as-is and the star of the first SCI frame is
             assumed for all of them.
+
+        combine_frames: bool
+            If True, combines the (aligned) frames of each visit with
+            self.input_combine_fn, giving one image per roll or reference
+            visit, as SpaceRDI does with the integrations of a JWST file. RC
+            visits are many short L3 frames, one per file. If False, every
+            frame is kept as its own image.
         """
         if isinstance(concat, numbers.Number):
             concat_str = list(self.database.obs.keys())[concat]
@@ -330,6 +337,18 @@ class RCRDI(SpaceRDI):
             dates.append(info['date'])
 
         c_coron = np.array(c_coron)
+        visit_ids, dates = np.array(visit_ids), np.array(dates)
+        posangs = np.array(posangs)
+        if combine_frames:
+            # One image per visit (keeping its first file, date and roll), SCI visits first as in the table.
+            first = np.sort(np.unique(visit_ids, return_index=True)[1])
+            first = first[np.argsort(~sci[first], kind='stable')]
+            combined = [self.input_combine_fn(np.array(imcube)[visit_ids == visit_ids[i]],
+                                              np.array(errcube)[visit_ids == visit_ids[i]] if self.prop_err else None,
+                                              **self.input_combine_kws) for i in first]
+            imcube, errcube = [im for im, _ in combined], [err for _, err in combined]
+            files, posangs, visit_ids, dates, c_coron = files[first], posangs[first], visit_ids[first], dates[first], c_coron[first]
+            sci, ref = sci[first], ref[first]
         self._coron_offsets = self._c_star - c_coron
         self._image_mask = info['mask']
         self._pupil_mask = info['lyot']

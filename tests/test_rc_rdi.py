@@ -92,3 +92,52 @@ def test_data_ext_corgidrp_name(rc_fixture, tmp_path):
     db = RCDatabase(str(tmp_path / 'out'))
     db.add_concat([f], [])
     assert RCRDI(db, verbose=False).data_ext == 'l3'
+
+
+@pytest.fixture
+def multi_frame_db(tmp_path):
+    """Three frames per SCI visit and two per REF visit, each its own file (as corgidrp writes L3)."""
+    rng = np.random.default_rng(1)
+    sci, ref = [], []
+    for i, roll in enumerate(c.SCI_ROLLS):
+        for k in range(3):
+            p = str(tmp_path / f'sci{i}_{k}.fits')
+            c._write_rc_file(p, roll, f'000010010010010010{i}', rng, planet=True,
+                             star_xy=np.add(c.STAR_XY, c.SCI_OFFSETS[i]) + 0.1*k)
+            sci.append(p)
+    for i in range(c.NREF):
+        for k in range(2):
+            p = str(tmp_path / f'ref{i}_{k}.fits')
+            c._write_rc_file(p, 0.0, f'000010010010020010{i}', rng, psfref=True,
+                             star_xy=np.add(c.STAR_XY, c.REF_OFFSETS[i]) - 0.1*k)
+            ref.append(p)
+    db = RCDatabase(str(tmp_path / 'out'))
+    db.add_concat(sci, ref)
+    return db
+
+
+def test_combine_frames(multi_frame_db):
+    rdi = RCRDI(multi_frame_db, pad_data=None, verbose=False)
+    rdi.load_concat(0)
+    assert rdi.imcube_sci.shape == (len(c.SCI_ROLLS), c.NY, c.NX)
+    assert rdi.imcube_ref.shape == (c.NREF, c.NY, c.NX)
+    assert len(set(rdi._visit_ids_sci)) == len(c.SCI_ROLLS) and len(rdi._files_sci) == len(c.SCI_ROLLS)
+    assert np.allclose(rdi._posangs_sci, np.mod(c.SCI_ROLLS, 360))
+    # median_combine ERR from the 1e-4 per-frame ERR: 3 frames (SCI) and 2 frames (REF), away from shifted edges.
+    inner = (slice(None), slice(5, -5), slice(5, -5))
+    assert np.allclose(rdi.errcube_sci[inner], np.sqrt(np.pi*7/12)*1e-4/np.sqrt(3), rtol=1e-3)
+    assert np.allclose(rdi.errcube_ref[inner], 1e-4/np.sqrt(2), rtol=1e-3)
+    for im in [*rdi.imcube_sci, *rdi.imcube_ref]:
+        assert np.allclose(_centroid(im, rdi.c_star), rdi.c_star, atol=0.05)
+
+    frames = RCRDI(multi_frame_db, pad_data=None, verbose=False)
+    frames.load_concat(0, combine_frames=False)
+    assert frames.imcube_sci.shape == (3*len(c.SCI_ROLLS), c.NY, c.NX)
+    assert frames.imcube_ref.shape == (2*c.NREF, c.NY, c.NX)
+
+
+def test_jackknife_multi_frame(multi_frame_db):
+    rdi = RCRDI(multi_frame_db, pad_data=None, verbose=False)
+    rdi.load_concat(0)
+    inds, rescube, errcube = rdi.jackknife_references(show_progress=False)
+    assert rescube.shape == (c.NREF, len(c.SCI_ROLLS), c.NY, c.NX)
