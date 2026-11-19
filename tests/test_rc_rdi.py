@@ -33,7 +33,7 @@ def test_shapes_and_metadata(db):
     assert rdi.imcube_ref.shape == (c.NREF, c.NY, c.NX)
     assert rdi.errcube_sci.shape == rdi.imcube_sci.shape
     assert rdi.errcube_ref.shape == rdi.imcube_ref.shape
-    assert np.allclose(rdi._posangs_sci, c.SCI_ROLLS)
+    assert np.allclose(rdi._posangs_sci, np.mod(c.SCI_ROLLS, 360))
     assert len(set(rdi._visit_ids_sci)) == len(c.SCI_ROLLS)
     assert np.isclose(rdi.pxscale.value, c.PXSCALE)
     assert np.isclose(rdi._lam.value, 0.575)

@@ -690,7 +690,7 @@ class SpaceRDI:
         else:
             im_rolls = err_rolls = None
 
-        products = SpaceReduction(spacerdi=self, im=im_col, rolls=im_rolls,
+        products = getattr(self, 'reduction_class', SpaceReduction)(spacerdi=self, im=im_col, rolls=im_rolls,
                                 err=err_col, err_rolls=err_rolls,
                                 c_star_out=self.c_star, c_coron_out=c_coron_out,
                                 derotated=derotate, distortion_corrected=correct_distortion,
@@ -1691,7 +1691,7 @@ class SpaceRDI:
         else:
             im_deconv = None
 
-        products = SpaceReduction(spacerdi=self, im=im_deconv, rolls=rolls_deconv,
+        products = getattr(self, 'reduction_class', SpaceReduction)(spacerdi=self, im=im_deconv, rolls=rolls_deconv,
                                   c_star_out=reduc.c_star, c_coron_out=reduc.c_coron,
                                   derotated=reduc.derotated, distortion_corrected=reduc.distortion_corrected,
                                   output_ext=f'{reduc.output_ext}_{output_suffix}', reduc_label=reduc_label)

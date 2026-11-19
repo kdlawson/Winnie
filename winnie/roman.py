@@ -3,10 +3,12 @@ import os
 
 import astropy.units as u
 import numpy as np
+from astropy import wcs
 from astropy.io import fits
 from astropy.table import Table
+from pyklip.klip import _rotate_wcs_hdr
 
-from .space import SpaceRDI
+from .space import SpaceRDI, SpaceReduction
 from .utils import ang_size_to_px_size, pad_or_crop_image
 
 # Band reference wavelengths (microns) from cgisim; sub-bands (e.g. 1A) map to their band.
@@ -30,19 +32,23 @@ def read_rc_header(h0, h1):
     Returns
     -------
     info: dict
-        Keys: posang (deg), c_star and c_coron (0-based x, y pixels; None if
-        STARLOCX/Y are absent, as in default L3 products), pxscale
+        Keys: posang (deg; NORTHANG, else PA_APER, else ROLL), c_star and
+        c_coron (0-based x, y pixels; None if STARLOCX/Y are absent, as in
+        default L3 products), pxscale
         (arcsec/pixel), wavel (microns), filter, mask, lyot, date, visit,
         psfref and satspots.
     """
     if h1.get('DATALVL') not in ('L3', 'L4'):
         raise ValueError(f"DATALVL={h1.get('DATALVL')}; Winnie requires L3/L4 products from corgidrp.")
-    if 'PA_APER' in h0:
+    # NORTHANG (corgidrp create_wcs) adds the astrometric north angle to the roll; corgidrp derotates by it.
+    if 'NORTHANG' in h1:
+        posang = h1['NORTHANG']
+    elif 'PA_APER' in h0:
         posang = h0['PA_APER']
     elif 'ROLL' in h0:
         posang = h0['ROLL']
     else:
-        raise ValueError('No PA_APER or ROLL in primary header.')
+        raise ValueError('No NORTHANG, PA_APER or ROLL in headers.')
     band = h1['CFAMNAME'][0]
     if band not in RC_CWAVEL:
         raise ValueError(f"Unknown CFAM band: {h1['CFAMNAME']}")
@@ -175,6 +181,48 @@ class RCDatabase:
         self.obs[concat] = tab
         return concat
 
+    def add_product(self, concat, filename):
+        """
+        Record a saved Winnie product in red[concat], replacing any entry with
+        the same file (the RC stand-in for spaceKLIP's read_jwst_s3_data).
+        """
+        row = {'FITSFILE': os.path.abspath(filename),
+               'OUTPUT_EXT': fits.getheader(filename, 0).get('OUTPUT_EXT', '')}
+        if concat not in self.red:
+            self.red[concat] = Table(names=list(row), dtype=[object, object])
+        tab = self.red[concat]
+        dup = np.where(tab['FITSFILE'] == row['FITSFILE'])[0]
+        if len(dup):
+            tab.remove_rows(dup)
+        tab.add_row(row)
+
+
+class RCReduction(SpaceReduction):
+    """
+    SpaceReduction for RC products. Derotated WCS headers are rotated by the
+    roll from read_rc_header (NORTHANG), since RC headers have no ROLL_REF.
+    """
+
+    def __init__(self, file_to_load=None, spacerdi=None, output_ext=None, im=None, rolls=None,
+                 derotated=True, **kwargs):
+        new = spacerdi is not None and (im is not None or rolls is not None)
+        if not new and file_to_load is not None and output_ext is None:
+            # Avoids the parent's JWST filename parsing.
+            output_ext = fits.getheader(file_to_load, 0)['OUTPUT_EXT']
+        super().__init__(file_to_load=file_to_load, spacerdi=spacerdi, output_ext=output_ext, im=im,
+                         rolls=rolls, derotated=(derotated and not new), **kwargs)
+        if new and derotated:
+            # Image headers come from the first frame of each visit; the combined header copies the first.
+            uni_visit_inds = np.sort(np.unique(spacerdi._visit_ids_sci, return_index=True)[1])
+            posangs = spacerdi._posangs_sci[uni_visit_inds]
+            for h, posang in zip([*self.image_headers, self.combined_image_header], [*posangs, posangs[0]]):
+                w = wcs.WCS(h, naxis=[1, 2])
+                _rotate_wcs_hdr(w, posang)
+                h['CD1_1'], h['CD1_2'] = w.wcs.cd[0]
+                h['CD2_1'], h['CD2_2'] = w.wcs.cd[1]
+            self.derotated = True
+            self.primary_header['DEROT'] = True
+
 
 class RCRDI(SpaceRDI):
     """
@@ -183,6 +231,7 @@ class RCRDI(SpaceRDI):
     maps are off by default, since they rely on JWST-only tools (pysiaf,
     webbpsf_ext).
     """
+    reduction_class = RCReduction
 
     def __init__(self, database=None, data_ext=None, correct_distortion=False, distort_models=False,
                  save_coron_transmission=False, **kwargs):
@@ -193,6 +242,18 @@ class RCRDI(SpaceRDI):
         super().__init__(database=database, data_ext=data_ext, correct_distortion=correct_distortion,
                          distort_models=distort_models, save_coron_transmission=save_coron_transmission,
                          **kwargs)
+
+    def __getstate__(self):
+        # Always pickle the data: re-reading files on unpickle would skip alignment and DQ masking.
+        efficient_saving, self.efficient_saving = self.efficient_saving, False
+        state = super().__getstate__()
+        self.efficient_saving = efficient_saving
+        return state
+
+    def _save_products(self, products, include_instance=False, add_output_to_db=False):
+        super()._save_products(products, include_instance=include_instance, add_output_to_db=False)
+        if add_output_to_db:
+            self.database.add_product(self.concat, products.filename)
 
     def load_concat(self, concat, cropped_shape=None, align=True):
         """

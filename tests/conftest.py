@@ -55,7 +55,7 @@ def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc
     h0['ORIGIN'] = 'CorgiSim'
     h0['VISITID'] = visitid
     h0['PSFREF'] = int(psfref)
-    h0['PA_APER'] = roll
+    h0['PA_APER'] = roll % 360  # corgisim wraps to 0-360
     h0['TARGET'] = 'REF' if psfref else 'SCI'
 
     h1 = fits.Header()
@@ -75,6 +75,14 @@ def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc
     h1['FPAMNAME'] = 'HLC12_C2R1'
     h1['LSAMNAME'] = 'NFOV'
     h1['FTIMEUTC'] = '2027-01-01T00:00:00'
+    # WCS as corgidrp l2b_to_l3.create_wcs writes it, with astrometric north angle 0.
+    h1['NORTHANG'] = roll % 360
+    ang = np.deg2rad(roll)
+    cd = np.array([[-np.cos(ang), np.sin(ang)], [np.sin(ang), np.cos(ang)]]) * PXSCALE / 3600
+    h1['CTYPE1'], h1['CTYPE2'] = 'RA---TAN', 'DEC--TAN'
+    h1['CRPIX1'], h1['CRPIX2'] = (NX - 1) // 2, (NY - 1) // 2
+    h1['CRVAL1'], h1['CRVAL2'] = 0.0, 0.0
+    h1['CD1_1'], h1['CD1_2'], h1['CD2_1'], h1['CD2_2'] = cd.ravel()
 
     # Same extension layout and shapes as corgidrp L3: SCI (ny, nx), ERR (1, ny, nx), DQ (ny, nx).
     fits.HDUList([fits.PrimaryHDU(header=h0),
