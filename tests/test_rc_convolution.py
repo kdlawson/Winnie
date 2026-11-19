@@ -80,9 +80,18 @@ def test_psf_grid_cache(rdi):
     rdi2 = RCRDI(rdi.database, pad_data='auto', verbose=False)
     rdi2.load_concat(0)
     calls = []
-    rdi2.prepare_convolution(osamp=OSAMP, fov_pixels=FOV, grid_fn=lambda *a, **k: calls.append(1))
-    assert not calls
+
+    def counting_grid(*args, **kwargs):
+        calls.append(1)
+        return gaussian_psf_grid(*args, **kwargs)
+
+    # The cache file is keyed on the grid inputs: same inputs load it, different ones recompute.
+    rdi2.prepare_convolution(osamp=OSAMP, fov_pixels=FOV, grid_kwargs=dict(fwhm=FWHM))
     assert np.array_equal(rdi2.convolver.psfs, cached)
+    rdi2.prepare_convolution(osamp=OSAMP, fov_pixels=FOV, grid_kwargs=dict(fwhm=FWHM + 1))
+    rdi2.prepare_convolution(osamp=OSAMP, fov_pixels=FOV, grid_fn=counting_grid, grid_kwargs=dict(fwhm=FWHM))
+    assert len(calls) == 1
+    assert rdi2.convolver.psf_file != rdi.convolver.psf_file
 
 
 @pytest.mark.parametrize('sep_px, pa_deg', [(12.0, c.PLANET_PA_DEG), (6.0, 200.0)])
