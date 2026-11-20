@@ -52,6 +52,9 @@ def read_rc_header(h0, h1):
     """
     if h1.get('DATALVL') not in ('L3', 'L4'):
         raise ValueError(f"DATALVL={h1.get('DATALVL')}; Winnie requires L3/L4 products from corgidrp.")
+    # Default coronagraphic L4 (l3_to_l4 recipe) is already PSF-subtracted: a KL-mode cube, not input data.
+    if h1['DATALVL'] == 'L4' and (h0.get('PSFSUB') or h1.get('PSFSUB')):
+        raise ValueError(f"PSF-subtracted L4 (PSFSUB={h0.get('PSFSUB') or h1.get('PSFSUB')}); use the L3 frames.")
     # NORTHANG (corgidrp create_wcs) adds the astrometric north angle to the roll; corgidrp derotates by it.
     if 'NORTHANG' in h1:
         posang = h1['NORTHANG']
@@ -843,6 +846,12 @@ class RCRDI(SpaceRDI):
         c_coron = np.array(c_coron)
         visit_ids, dates = np.array(visit_ids), np.array(dates)
         posangs = np.array(posangs)
+        # Visits are grouped by VISITID, but corgidrp's mocks give every frame the same one: split such a VISITID
+        # by type and roll so that different rolls (or SCI and REF) are never combined.
+        keys = np.array([f"{v}_{'SCI' if s else 'REF'}{p:.2f}" for v, s, p in zip(visit_ids, sci, np.mod(posangs, 360))])
+        for v in np.unique(visit_ids):
+            if len(np.unique(keys[visit_ids == v])) > 1:
+                visit_ids = np.where(visit_ids == v, keys, visit_ids)
         if combine_frames:
             # One image per visit (keeping its first file, date and roll), SCI visits first as in the table.
             first = np.sort(np.unique(visit_ids, return_index=True)[1])

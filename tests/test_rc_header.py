@@ -69,6 +69,14 @@ def test_errors(rc_fixture):
     with pytest.raises(ValueError):
         read_rc_header(h0, h1_band)
 
+    # corgidrp L4 coron (docs data_formats/l4coron): PSFSUB in the primary header after do_psf_subtraction.
+    h0_l4, h1_l4 = h0.copy(), h1.copy()
+    h1_l4['DATALVL'] = 'L4'
+    assert read_rc_header(h0_l4, h1_l4)['posang'] == h1['NORTHANG']
+    h0_l4['PSFSUB'] = 'pyKLIP'
+    with pytest.raises(ValueError, match='PSF-subtracted'):
+        read_rc_header(h0_l4, h1_l4)
+
 
 def test_database_from_headers(rc_fixture, tmp_path):
     db = RCDatabase(str(tmp_path / 'out'))
