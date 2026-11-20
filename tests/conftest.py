@@ -39,9 +39,11 @@ def planet_xy(roll, star_xy=STAR_XY):
 
 
 def _write_rc_file(path, roll, visitid, rng, psfref=False, planet=False, starloc=True,
-                   star_xy=STAR_XY, bad_pixel=None):
+                   star_xy=STAR_XY, bad_pixel=None, disk=None):
     star = _gauss(*star_xy, fwhm=3.0) * (REF_SCALE if psfref else 1.0)
     img = star + (_gauss(*planet_xy(roll, star_xy), amp=PLANET_CONTRAST) if planet else 0)
+    if disk is not None:
+        img = img + disk(roll, star_xy)
     sci = (img + rng.normal(0, 1e-4, img.shape)).astype(np.float32)
     err = np.full((1, NY, NX), 1e-4, dtype=np.float32)
     dq = np.zeros((NY, NX), dtype=np.uint16)
