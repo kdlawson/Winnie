@@ -9,3 +9,6 @@ tutorials/hd106906_4qpm_example/WinnieRDI/
 winnie/_version.py
 Winnie.egg-info/
 build/
+tutorials/roman_rc_example/
+tutorials/roman_rc_example.tar.gz
+tutorials/_part*.ipynb

@@ -120,3 +120,27 @@ def test_ring_fm_chi2(ring_rdi):
     assert 0.5 < chi2(1.0) < 1.5
     assert chi2(0.9) > 2*chi2(1.0)
     assert chi2(0.0) > 100*chi2(1.0)
+
+
+def test_known_model_autoscale(ring_rdi):
+    # obj_fn with no fitted parameters and the convolved known model as a fixed component: autoscale returns its
+    # amplitude (the tutorial 8 pattern).
+    import lmfit
+    from winnie.modeling import make_region_of_interest_mask, obj_fn
+    rdi = ring_rdi
+    rdi.rdi_presets()
+    data = rdi.run_rdi(derotate=False)
+    model, cm = raw_ring_model()
+    cube = rdi.convolver.convolve_model(model, pxscale_in=rdi.pxscale/SUB, c_star_in=cm)
+    rdi.set_circumstellar_model(model_cube=cube)
+    fm = rdi.run_rdi(forward_model=True, derotate=False)
+    pa = np.deg2rad(c.PLANET_PA_DEG)
+    roi = make_region_of_interest_mask(data, rdi, rmin=6, rmax=24, rexcl_northup=PLANET_MASK,
+                                       dxy_northup=[c.PLANET_SEP_PX*np.array([-np.sin(pa), np.cos(pa)])])
+    out = obj_fn(lmfit.Parameters(), data, rdi, roi, 1., modelcubes_in=[cube], modellabels_in=['disk'],
+                 fmreducs_in=[fm], autoscale_in=[True], return_soln=True, count=False, clear_each_call=False)
+    coeffs = out[0]
+    assert np.isclose(coeffs[0], 1.0, rtol=0.03)
+    res = obj_fn(lmfit.Parameters(), data, rdi, roi, 1., modelcubes_in=[cube], modellabels_in=['disk'],
+                 fmreducs_in=[fm], autoscale_in=[True], err_weighting=True, count=False, clear_each_call=False)
+    assert 0.5 < np.mean(res**2) < 1.5

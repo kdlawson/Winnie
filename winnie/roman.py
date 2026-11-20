@@ -495,7 +495,8 @@ def _rc_psf_grid_compute(optics, sample_fn, weights, rvals_lamd, thvals_deg, osa
     samples = [np.load(os.path.join(parts, f'sample_{i:04d}.npz')) for i in range(len(r_all))]
     grid = dict(psfs=np.array([s['psf'] for s in samples], dtype=np.float32), rvals_lamd=r_all, thvals_deg=th_all,
                 throughput=np.array([float(s['total']) for s in samples])/calib['norm'],
-                offset_map_A=calib['A'], offset_map_b=calib['b'], norm=float(calib['norm']), key=key)
+                offset_map_A=calib['A'], offset_map_b=calib['b'], norm=float(calib['norm']), key=key,
+                res_mas=float(optics.res_mas))
     _write_rc_psf_grid(path, grid, optics, osamp, fov_pixels, subsample)
     shutil.rmtree(parts)
     return grid
@@ -546,30 +547,39 @@ def rc_grid_offsets(grid, res_mas, pxscale):
     return np.array([r, th]), xy
 
 
+def _rc_grid(optics, grid_file, **kwargs):
+    """Grid from a saved grid file (no corgisim needed) or from rc_psf_grid_samples."""
+    if grid_file is not None:
+        return _read_rc_psf_grid(grid_file)
+    if optics is None:
+        raise ValueError('RC PSF grids need grid_kwargs=dict(optics=CorgiOptics(...)) or dict(grid_file=...).')
+    return rc_psf_grid_samples(optics, **kwargs)
+
+
 def generate_rc_psf_grid(inst, source_spectrum=None, shift=None, osamp=2, fov_pixels=41, show_progress=True,
                          optics=None, rvals_lamd=RC_GRID_RVALS, thvals_deg=RC_GRID_THVALS, subsample=3,
-                         cache_dir=None, sample_fn=None):
+                         cache_dir=None, sample_fn=None, grid_file=None):
     """
     corgisim PSF grid for SpaceConvolution.fetch_psf_grid (grid_fn
-    convention). See rc_psf_grid_samples; `optics` (a CorgiOptics set up as
-    for the data) is required. Pair with rc_transmission_map, which
-    RCConvolution does by default.
+    convention). See rc_psf_grid_samples; needs either `optics` (a
+    CorgiOptics set up as for the data) or `grid_file` (a grid saved by
+    rc_psf_grid_samples, whose own sampling then applies). Pair with
+    rc_transmission_map, which RCConvolution does by default.
 
     Returns
     -------
     psfs, psfs, offsets_polar, offsets_xy
     """
-    if optics is None:
-        raise ValueError('generate_rc_psf_grid needs grid_kwargs=dict(optics=CorgiOptics(...)).')
-    grid = rc_psf_grid_samples(optics, rvals_lamd, thvals_deg, osamp=osamp, fov_pixels=fov_pixels,
-                               source_spectrum=source_spectrum, subsample=subsample, cache_dir=cache_dir,
-                               show_progress=show_progress, sample_fn=sample_fn)
-    offsets_polar, offsets_xy = rc_grid_offsets(grid, optics.res_mas, inst.pxscale)
+    grid = _rc_grid(optics, grid_file, rvals_lamd=rvals_lamd, thvals_deg=thvals_deg, osamp=osamp,
+                    fov_pixels=fov_pixels, source_spectrum=source_spectrum, subsample=subsample, cache_dir=cache_dir,
+                    show_progress=show_progress, sample_fn=sample_fn)
+    offsets_polar, offsets_xy = rc_grid_offsets(grid, grid['res_mas'], inst.pxscale)
     return grid['psfs'], grid['psfs'], offsets_polar, offsets_xy
 
 
 def rc_transmission_map(inst, c_coron, osamp=2, shape=None, return_oversample=True, posang=0, c_star=None,
-                        nd_squares=None, optics=None, fov_pixels=41, source_spectrum=None, **grid_kwargs):
+                        nd_squares=None, optics=None, fov_pixels=41, source_spectrum=None, grid_file=None,
+                        **grid_kwargs):
     """
     Coronagraph transmission map (FPM and field stop) from the throughput of
     the cached corgisim PSF grid, interpolated linearly in (r, theta) on the
@@ -578,9 +588,9 @@ def rc_transmission_map(inst, c_coron, osamp=2, shape=None, return_oversample=Tr
     ignored.
     """
     ny, nx = shape
-    grid = rc_psf_grid_samples(optics, osamp=osamp, fov_pixels=fov_pixels, source_spectrum=source_spectrum,
-                               **grid_kwargs)
-    polar, _ = rc_grid_offsets(grid, optics.res_mas, inst.pxscale)
+    grid = _rc_grid(optics, grid_file, osamp=osamp, fov_pixels=fov_pixels, source_spectrum=source_spectrum,
+                    **grid_kwargs)
+    polar, _ = rc_grid_offsets(grid, grid['res_mas'], inst.pxscale)
     yg, xg = c_to_c_osamp(np.indices((ny*osamp, nx*osamp), dtype=np.float64), 1/osamp)
     x, y = xg - c_coron[0], yg - c_coron[1]
     if posang != 0:
@@ -621,6 +631,8 @@ def _polar_interp(r_s, th_s, vals, r, th):
 
 def _grid_tag(grid_fn, grid_kwargs, fov_pixels, osamp, source_spectrum):
     """Short hash of the grid inputs, so the per-reduction grid file isn't reused for a different grid."""
+    if grid_fn is generate_rc_psf_grid and grid_kwargs.get('grid_file') is not None:
+        return fits.getheader(grid_kwargs['grid_file'])['GRIDKEY'][:8]
     if grid_fn is generate_rc_psf_grid:
         kw = {k: v for k, v in grid_kwargs.items() if k in ('rvals_lamd', 'thvals_deg', 'subsample', 'sample_fn')}
         return rc_psf_grid_key(grid_kwargs['optics'], osamp=osamp, fov_pixels=fov_pixels,

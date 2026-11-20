@@ -118,6 +118,9 @@ Included in the tutorials directory (for use with the [tutorial notebooks](https
   these data is reported in Rouan et al. (2025). These
   data are featued in tutorial 7.
 
+- Simulated Roman Coronagraph (HLC band 1) corgidrp L3 products with exozodi
+  disks and a planet (default corgisim and corgidrp). Featured in tutorial 8;
+  not included in the repository, available on request from Jorge Llop-Sayson.
 
 ### Current limitations:
 

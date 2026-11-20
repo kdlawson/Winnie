@@ -193,3 +193,27 @@ def test_pickle(rdi, tmp_path):
     conv = pickle.loads(pickle.dumps(rdi.convolver))
     assert np.array_equal(conv.psfs, rdi.convolver.psfs)
     assert np.array_equal(conv.coron_tmaps_osamp, rdi.convolver.coron_tmaps_osamp)
+
+
+def test_grid_file(rdi, tmp_path):
+    # A saved grid file gives the same grid, offsets and transmission map as the optics, without corgisim.
+    grid = _grid(tmp_path)
+    path = str(tmp_path / f"rc_psfgrid_{grid['key']}.fits")
+    inst = RCInstrument(c.PXSCALE, 0.575)
+    kw = dict(optics=_fake_optics(), rvals_lamd=RVALS, thvals_deg=THVALS, fov_pixels=FOV, osamp=OSAMP,
+              cache_dir=str(tmp_path), show_progress=False, sample_fn=fake_image)
+    a = generate_rc_psf_grid(inst, **kw)
+    b = generate_rc_psf_grid(inst, osamp=OSAMP, fov_pixels=FOV, grid_file=path)
+    for x, y in zip(a, b):
+        assert np.allclose(x, y)
+    shape, cc = (41, 41), np.array([20., 20.])
+    ta = rc_transmission_map(inst, cc, shape=shape, posang=30, **{k: v for k, v in kw.items() if k != 'osamp'})
+    tb = rc_transmission_map(inst, cc, shape=shape, posang=30, fov_pixels=FOV, grid_file=path)
+    assert np.allclose(ta, tb)
+    rdi.prepare_convolution(osamp=OSAMP, fov_pixels=FOV, grid_fn=generate_rc_psf_grid,
+                            grid_kwargs=dict(grid_file=path))
+    assert grid['key'][:8] in rdi.convolver.psf_file
+    assert rdi.convolver.transmission_map_fn is rc_transmission_map
+    assert np.allclose(rdi.convolver.psfs, grid['psfs'])
+    with pytest.raises(ValueError):
+        generate_rc_psf_grid(inst)
