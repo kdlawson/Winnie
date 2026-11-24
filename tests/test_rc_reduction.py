@@ -37,7 +37,7 @@ def test_save_and_register(rdi):
     assert isinstance(products, RCReduction)
     assert products.filename == f'{rdi.output_dir}RC_0_rdi_psfsub_i2d.fits'
     assert os.path.isfile(products.filename)
-    assert list(rdi.database.red['RC_0']['FITSFILE']) == [products.filename]
+    assert list(rdi.database.red['RC_0']['FITSFILE']) == [os.path.abspath(products.filename)]
     assert list(rdi.database.red['RC_0']['OUTPUT_EXT']) == ['rdi_psfsub']
     with pytest.raises(OSError):
         rdi.run_rdi(save_products=True)

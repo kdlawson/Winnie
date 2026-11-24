@@ -463,7 +463,8 @@ def _rc_psf_grid_compute(optics, sample_fn, weights, rvals_lamd, thvals_deg, osa
 
     calib_file = os.path.join(parts, 'calib.npz')
     if os.path.isfile(calib_file):
-        calib = dict(np.load(calib_file))
+        with np.load(calib_file) as f:
+            calib = dict(f)
     else:
         # Unocculted, no field stop: offset map from on-axis and +x/+y sources; b from the aberration-free on-axis PSF.
         o = 6*optics.res_mas
@@ -492,9 +493,13 @@ def _rc_psf_grid_compute(optics, sample_fn, weights, rvals_lamd, thvals_deg, osa
         # A fully occulted sample (zero flux) keeps a zero PSF; its transmission is zero anyway.
         np.savez(part, psf=(psf/total if total > 0 else psf).astype(np.float32), total=total)
 
-    samples = [np.load(os.path.join(parts, f'sample_{i:04d}.npz')) for i in range(len(r_all))]
-    grid = dict(psfs=np.array([s['psf'] for s in samples], dtype=np.float32), rvals_lamd=r_all, thvals_deg=th_all,
-                throughput=np.array([float(s['total']) for s in samples])/calib['norm'],
+    psfs, totals = [], []
+    for i in range(len(r_all)):
+        with np.load(os.path.join(parts, f'sample_{i:04d}.npz')) as s:
+            psfs.append(s['psf'])
+            totals.append(float(s['total']))
+    grid = dict(psfs=np.array(psfs, dtype=np.float32), rvals_lamd=r_all, thvals_deg=th_all,
+                throughput=np.array(totals)/calib['norm'],
                 offset_map_A=calib['A'], offset_map_b=calib['b'], norm=float(calib['norm']), key=key,
                 res_mas=float(optics.res_mas))
     _write_rc_psf_grid(path, grid, optics, osamp, fov_pixels, subsample)

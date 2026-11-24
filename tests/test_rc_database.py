@@ -16,7 +16,7 @@ def db(rc_fixture, tmp_path):
 
 def test_output_dir(db):
     assert os.path.isdir(db.output_dir)
-    assert db.output_dir.endswith('/')
+    assert db.output_dir.endswith(os.sep)
     assert db.red == {}
 
 
