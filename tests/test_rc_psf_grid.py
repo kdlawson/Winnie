@@ -217,6 +217,14 @@ def test_grid_file(rdi, tmp_path):
     assert np.allclose(rdi.convolver.psfs, grid['psfs'])
     with pytest.raises(ValueError):
         generate_rc_psf_grid(inst)
+    # The file's sampling must match what the convolver uses.
+    for osamp, fov in [(OSAMP + 1, FOV), (OSAMP, FOV + 2)]:
+        with pytest.raises(ValueError, match='fov_pixels'):
+            generate_rc_psf_grid(inst, osamp=osamp, fov_pixels=fov, grid_file=path)
+    rdi.convolver = None
+    with pytest.raises(ValueError, match='fov_pixels'):
+        rdi.prepare_convolution(osamp=OSAMP + 1, fov_pixels=FOV, grid_fn=generate_rc_psf_grid,
+                                grid_kwargs=dict(grid_file=path))
 
 
 def test_deconvolution(rdi, tmp_path):

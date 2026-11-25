@@ -533,7 +533,8 @@ def _read_rc_psf_grid(path):
         return dict(psfs=hdul[0].data.astype(np.float32), rvals_lamd=r, thvals_deg=th,
                     throughput=hdul['THROUGHPUT'].data.astype(float), offset_map_A=hdul['OFFSET_A'].data,
                     offset_map_b=hdul['OFFSET_B'].data, norm=hdul[0].header['NORM'], key=hdul[0].header['GRIDKEY'],
-                    res_mas=hdul[0].header['RES_MAS'])
+                    res_mas=hdul[0].header['RES_MAS'], osamp=hdul[0].header['OSAMP'],
+                    fov_pixels=hdul[0].header['FOVPIX'])
 
 
 def rc_grid_offsets(grid, res_mas, pxscale):
@@ -568,7 +569,7 @@ def generate_rc_psf_grid(inst, source_spectrum=None, shift=None, osamp=2, fov_pi
     corgisim PSF grid for SpaceConvolution.fetch_psf_grid (grid_fn
     convention). See rc_psf_grid_samples; needs either `optics` (a
     CorgiOptics set up as for the data) or `grid_file` (a grid saved by
-    rc_psf_grid_samples, whose own sampling then applies). Pair with
+    rc_psf_grid_samples, whose osamp and fov_pixels must match). Pair with
     rc_transmission_map, which RCConvolution does by default.
 
     Returns
@@ -578,6 +579,9 @@ def generate_rc_psf_grid(inst, source_spectrum=None, shift=None, osamp=2, fov_pi
     grid = _rc_grid(optics, grid_file, rvals_lamd=rvals_lamd, thvals_deg=thvals_deg, osamp=osamp,
                     fov_pixels=fov_pixels, source_spectrum=source_spectrum, subsample=subsample, cache_dir=cache_dir,
                     show_progress=show_progress, sample_fn=sample_fn)
+    if grid_file is not None and (grid['osamp'], grid['fov_pixels']) != (osamp, fov_pixels):
+        raise ValueError(f"Grid file {grid_file} has osamp={grid['osamp']}, fov_pixels={grid['fov_pixels']}; "
+                         f"got osamp={osamp}, fov_pixels={fov_pixels}.")
     offsets_polar, offsets_xy = rc_grid_offsets(grid, grid['res_mas'], inst.pxscale)
     return grid['psfs'], grid['psfs'], offsets_polar, offsets_xy
 
