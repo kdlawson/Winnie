@@ -12,7 +12,6 @@ classifiers = [
     ]
 dependencies = [
     "astropy",
-    "joblib",
     "jwst",
     "lmfit",
     "matplotlib",
@@ -22,6 +21,7 @@ dependencies = [
     "scipy>=1.16",
     "scikit-learn",
     "spaceKLIP",
+    "torch>=2.1",
     "tqdm",
     "vip_hci", 
     "stpsf",
@@ -31,7 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tutorials = ["synphot",]
-gpu = ["cupy",]   
+test = ["pytest",]
 
 
 [project.urls]

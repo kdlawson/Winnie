@@ -119,9 +119,40 @@ Included in the tutorials directory (for use with the [tutorial notebooks](https
   data are featued in tutorial 7.
 
 
+### Hardware acceleration:
+
+Winnie's most computationally intensive calculations (PSF subtraction, model convolution,
+deconvolution, and the interpolation involved in rotating and distortion correcting images) are
+carried out with [PyTorch](https://pytorch.org), so they can run on an Apple Silicon GPU
+(`'mps'`), a CUDA GPU (`'cuda'`), or the CPU (`'cpu'`). By default, the best available of these
+is used, with priority `'mps'` > `'cuda'` > `'cpu'`. To choose a different device:
+
+```
+import winnie
+
+winnie.set_default_device('cpu')               # for everything in this session, or
+wdb = winnie.SpaceRDI(db, device='cuda:1')     # for a particular SpaceRDI (and its convolver)
+```
+
+The default can also be set by defining the `WINNIE_DEVICE` environment variable before importing
+Winnie (e.g., `WINNIE_DEVICE=cpu`). Notes:
+
+- Apple's `'mps'` backend does not support float64, so calculations on it are carried out in
+  float32 (on the CPU and CUDA, float64 inputs are processed in float64). In tests, results from
+  `'mps'` and `'cpu'` differ by well below the noise level of the data.
+- Winnie sets `PYTORCH_ENABLE_MPS_FALLBACK=1` before importing PyTorch so that any operations that
+  are not implemented for `'mps'` run on the CPU instead of raising an error. This only works if
+  Winnie is imported before PyTorch; set the variable to `0` (before starting Python) to opt out.
+- The `ncores` argument of `SpaceRDI`, if positive, sets the number of CPU threads PyTorch uses for
+  calculations on the CPU (`torch.set_num_threads`), which is also the number of threads used to
+  convolve images with spatially varying PSFs in parallel.
+- Rotation, derotation, and distortion correction use PyTorch's bicubic interpolation, which is not
+  identical to the cubic spline interpolation that was used previously.
+
 ### Current limitations:
 
-- Many of the operations are written to optionally run on a GPU (by passing use_gpu=True when initializing winnie.SpaceRDI). However, I'm still working through updating these functions in a few cases, so the code will currently override this option with use_gpu=False.
+- The pixel coordinates used for distortion correction come from pySIAF, which runs on the CPU, so
+  distortion correction and distorted model convolution are not fully accelerated.
 
 - winnie.SpaceRDI should propagate pixel-wise uncertainties from the ERR FITS extensions by default. However, a) these neglect speckle noise / speckle residuals, and b) the current SpaceKLIP ramp fitting with pseudo reference pixels significantly reduces noise but doesn't change the noise maps versus the standard pipeline — so these (generally) overestimate the noise. In other words, these are not statistically robust currently, but may still be useful for relative comparisons.
 
@@ -142,13 +173,13 @@ Please also consider including citations to Winnie's dependencies — especially
 Among these dependencies are:  
 
     Astropy (Astropy Collaboration et al. 2013, 2018, 2022)  
-    CuPy (Okuta et al. 2017)  
     JWST Calibration Pipeline (Bushouse et al. 2022)
     LMFIT (Newville et al. 2022)  
     Matplotlib (Hunter 2007; Caswell et al. 2021)  
     NumPy (Harris et al. 2020)  
     POPPY (Perrin et al. 2012)  
     pyKLIP (Wang et al. 2015)  
+    PyTorch (Paszke et al. 2019)  
     SciPy (Virtanen et al. 2020)  
     SpaceKLIP (Kammerer et al. 2022)  
     Vortex Image Processing (Gomez Gonzalez et al. 2017)  

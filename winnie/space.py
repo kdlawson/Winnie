@@ -18,6 +18,8 @@ import warnings
 
 from .rdi import (rdi_residuals, build_annular_rdi_zones, _prepare_reference_matrices)
 
+from .backend import (get_device, set_cpu_threads, device_available, use_device)
+
 from .plot import (mpl, plt, quick_implot, mpl_centered_extent)
 
 from .utils import (median_combine, ang_size_to_px_size, px_size_to_ang_size,
@@ -27,7 +29,7 @@ from .utils import (median_combine, ang_size_to_px_size, px_size_to_ang_size,
                     nan_median_absolute_deviation)
 
 from .convolution import (_get_psf_patch_bounds,
-                          convolve_with_spatial_psfs,
+                          SpatialPSFConvolver,
                           get_jwst_psf_grid_inds,
                           get_jwst_coron_transmission_map,
                           generate_lyot_psf_grid,
@@ -40,10 +42,22 @@ from .distortion import (get_siaf_aper,
                          distort_image, 
                          undistort_image)
 
+def _usable_device(device):
+    """
+    Returns device if it is available on this system (or None). Otherwise, warns and returns None so that the default
+    device is used instead (e.g., for an instance that was saved with device='mps' and is loaded on a system without it).
+    """
+    if device is not None and not device_available(device):
+        warnings.warn(f"The device '{device}' stored with this instance is not available on this system, so the "
+                      "default device will be used instead.")
+        return None
+    return device
+
+
 class SpaceRDI:
     def __init__(self, database=None, output_basedir=None,
                  output_subdir='WinnieRDI', data_ext=None,
-                 ncores=-1, use_gpu=False, verbose=True, show_plots=False,
+                 ncores=-1, device=None, verbose=True, show_plots=False,
                  overwrite=False, prop_err=True, show_progress=False,
                  input_combine_fn=median_combine, input_combine_kws={}, 
                  output_combine_fn=median_combine, output_combine_kws={}, 
@@ -74,12 +88,18 @@ class SpaceRDI:
             first concatenation (excluding the '.fits' extension).
 
         ncores: int
-            Number of processor cores to use where applicable.
+            Number of CPU threads that PyTorch should use for calculations that run
+            on the CPU. If positive, this sets PyTorch's (process-wide) thread count
+            (torch.set_num_threads) when the instance is created; otherwise
+            PyTorch's default is left unchanged.
 
-        use_gpu: bool
-            Use GPU operations on a CUDA-capable GPU in place of some CPU
-            operations. Note: this is currently not used. Still working on
-            updating the GPU code.
+        device: str, torch.device, or None
+            The PyTorch device on which to carry out the most computationally
+            intensive calculations (e.g., 'cpu', 'mps', 'cuda'). If None, the
+            default device is used: the best available of 'mps', 'cuda', and 'cpu',
+            unless changed with winnie.set_default_device (see winnie.backend).
+            Note that devices that do not support float64 (e.g., 'mps') carry out
+            calculations in float32.
 
         verbose: bool
             Provides some reduction info in print statements in a few places.
@@ -195,8 +215,9 @@ class SpaceRDI:
                 self.data_ext = self.database.obs[list(self.database.obs.keys())[0]]['FITSFILE'][0].split('_')[-1].removesuffix('.fits')
             else:
                 self.data_ext = data_ext
+            set_cpu_threads(ncores)
             self.ncores = ncores
-            self.use_gpu = use_gpu
+            self.device = device
             self.verbose = verbose
             self.show_plots = show_plots
             self.overwrite = overwrite
@@ -217,9 +238,6 @@ class SpaceRDI:
             self.save_coron_transmission = save_coron_transmission
             self.save_instance = save_instance
             self.efficient_saving = efficient_saving
-            if self.use_gpu:
-                print("Warning! GPU implementation still in progress; setting use_gpu to False.")
-                self.use_gpu = False
        
         
     def load_concat(self, concat, coron_offsets=None, cropped_shape=None, siaf_aper=None):
@@ -578,8 +596,7 @@ class SpaceRDI:
                             hcube_ref=self.imcube_ref[:, np.newaxis],
                             optzones=self.optzones, 
                             subzones=self.subzones,
-                            use_gpu=self.use_gpu, 
-                            ncores=self.ncores,
+                            device=self.device,
                             err_hcube=err_hcube,
                             err_hcube_ref=err_hcube_ref,
                             show_progress=self.show_progress,
@@ -603,7 +620,7 @@ class SpaceRDI:
     
 
     def _build_reference_cache(self, **settings):
-        hcube_ref = self.imcube_ref[:, np.newaxis].astype(np.float64)
+        hcube_ref = self.imcube_ref[:, np.newaxis]
         if settings.get('opt_smoothing_fn') is not None:
             hcube_ref_opt = settings['opt_smoothing_fn'](hcube_ref, **settings.get('opt_smoothing_kwargs', {}))
         else:
@@ -644,7 +661,8 @@ class SpaceRDI:
                                                             osamp=1,
                                                             method='cubic', # cubic is slower but better fidelity since we don't have the luxury of oversampled pixels
                                                             fill_value=np.nan,
-                                                            c_star=self.c_star)
+                                                            c_star=self.c_star,
+                                                            device=self.device)
 
                 if errcube is not None:
                     errcube[i] = undistort_image(errcube[i], 
@@ -655,20 +673,19 @@ class SpaceRDI:
                                                 osamp=1,
                                                 method='cubic',
                                                 fill_value=np.nan,
-                                                c_star=self.c_star)[0]
+                                                c_star=self.c_star,
+                                                device=self.device)[0]
         else: # not correct_distortion
             if derotate:
                 imcube = rotate_hypercube(imcube, -self._posangs_sci,
-                                            cent=self.c_star, ncores=self.ncores, 
-                                            use_gpu = self.use_gpu, cval0=np.nan)
+                                            cent=self.c_star, device=self.device, cval0=np.nan)
                 
                 for i, posang in enumerate(self._posangs_sci):
                     c_coron_out[i] = xy_polar_ang_displacement(*self.c_coron_sci[i], posang, *self.c_star)
                     
                 if errcube is not None:
                     errcube = rotate_hypercube(errcube, -self._posangs_sci,
-                                            cent=self.c_star, ncores=self.ncores,
-                                            use_gpu = self.use_gpu, cval0=np.nan)
+                                            cent=self.c_star, device=self.device, cval0=np.nan)
                 
         if derotate:
             im_col, err_col = self.output_combine_fn(imcube, errcube, **self.output_combine_kws)
@@ -896,13 +913,6 @@ class SpaceRDI:
         opt_smoothing_kwargs: dict
             If opt_smoothing_fn is not None, arguments to pass to
             opt_smoothing_fn when it is called.
-
-        large_arrs: bool
-            If True (and if use_gpu=False), PSF model reconstruction will use
-            smaller parallelized calculations. If False, larger vectorized
-            calculations will be used instead. See the docstring for
-            winnie.rdi.reconstruct_psf_model_cpu for more information. Default
-            is False.
         """
         self.fixed_rdi_settings = settings
         self.rdi_settings.update(self.fixed_rdi_settings)
@@ -1103,7 +1113,7 @@ class SpaceRDI:
         if self.convolver is None or convolver_args != self.convolver_args: # If the convolver is not already set up or the args have changed
             if convolver_basedir is None:
                 convolver_basedir = self.output_dir
-            self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, use_gpu=self.use_gpu,
+            self.convolver = SpaceConvolution(database=self.database, source_spectrum=source_spectrum, ncores=self.ncores, device=self.device,
                                               verbose=self.verbose, show_plots=self.show_plots, show_progress=True, overwrite=self.overwrite,
                                               output_basedir=convolver_basedir, output_subdir=convolver_subdir, fetch_opd_by_date=fetch_opd_by_date,
                                               pad_data=self.pad_data, efficient_saving=self.efficient_saving, convolution_method=convolution_method,
@@ -1297,7 +1307,8 @@ class SpaceRDI:
                         else:
                             inst = webbpsf_ext.MIRI_ext(filter=self.filt, pupil_mask=pupil_mask_ext, image_mask=self._image_mask, oversample=3)
                         inst.aperturename = self._aperturename
-                    coron_tmaps[i] = get_jwst_coron_transmission_map(inst, c_coron, osamp=3, shape=(self.ny, self.nx), return_oversample=False, nd_squares=True)
+                    with use_device(self.device):
+                        coron_tmaps[i] = get_jwst_coron_transmission_map(inst, c_coron, osamp=3, shape=(self.ny, self.nx), return_oversample=False, nd_squares=True)
             else: # Load the provided transmission map
                 coron_tmap = fits.getdata(maskfiles[i])
                 if self.pad_data is not None:
@@ -1589,7 +1600,7 @@ class SpaceRDI:
         if reduc.derotated:
             deconv_psfs = np.array([
                 webbpsf_ext.image_manip.frebin(
-                    rotate_image(deconv_psfs, -posang, cval0=0.),
+                    rotate_image(deconv_psfs, -posang, cval0=0., device=self.device),
                     scale=1/self.convolver.osamp, total=True
                 )
                 for posang in self._posangs_sci
@@ -1621,17 +1632,19 @@ class SpaceRDI:
                 deconv_coron_tmaps[i] = 1.
             else:
                 if reduc.distortion_corrected:
-                    deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
-                        self.convolver.inst_webbpsfext, c_coron,
-                        return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
-                        shape=(self.ny, self.nx), posang=posang_i, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
+                    with use_device(self.device):
+                        deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
+                            self.convolver.inst_webbpsfext, c_coron,
+                            return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
+                            shape=(self.ny, self.nx), posang=posang_i, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
                 else:
-                    tcoron = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=True,
-                                                                 osamp=self.convolver.osamp, nd_squares=False, shape=(self.ny, self.nx), 
-                                                                 posang=0, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
+                    with use_device(self.device):
+                        tcoron = self.convolver.transmission_map_fn(self.convolver.inst_webbpsfext, c_coron, return_oversample=True,
+                                                                     osamp=self.convolver.osamp, nd_squares=False, shape=(self.ny, self.nx), 
+                                                                     posang=0, c_star=reduc.c_star, **self.convolver.transmission_map_kwargs)
                     
                     tcoron = distort_image(tcoron, self.siaf_aper, self.c_coron_sci[i], self.pxscale, posang_out=posang_i,
-                                           osamp=self.convolver.osamp, method='linear', c_star=self.c_star, fill_value=1.)[0]
+                                           osamp=self.convolver.osamp, method='linear', c_star=self.c_star, fill_value=1., device=self.device)[0]
                     
                     deconv_coron_tmaps[i] = webbpsf_ext.image_manip.frebin(tcoron, scale=1/self.convolver.osamp, total=False)
 
@@ -1676,7 +1689,7 @@ class SpaceRDI:
             out = coronagraphic_richardson_lucy(
                         image_in, deconv_psfs[psf_i], psf_inds=deconv_psf_inds[i], im_mask=deconv_coron_tmaps[i],
                         num_iter=num_iter, im_deconv_in=im_deconv_in, epsilon=epsilon, return_iters=return_iters,
-                        use_gpu=self.use_gpu, ncores=self.ncores, excl_mask=excl_mask, show_progress=show_progress,
+                        device=self.device, excl_mask=excl_mask, show_progress=show_progress,
                         convolution_method=convolution_method, conv_patch_bounds=conv_patch_bounds[i],
                         conv_used_inds=conv_used_inds[i], **deconv_kws
             )
@@ -1768,6 +1781,11 @@ class SpaceRDI:
 
     def __setstate__(self, state):
         self.__dict__.update(state) # Restore attributes
+        # Instances saved before PyTorch devices replaced use_gpu (and large_arrs) may still carry these
+        self.__dict__.pop('use_gpu', None)
+        for settings in (getattr(self, 'rdi_settings', {}), getattr(self, 'fixed_rdi_settings', {})):
+            settings.pop('large_arrs', None)
+        self.device = _usable_device(state.get('device'))
         if 'input_combine_fn' not in state:
             self.input_combine_fn = median_combine
         if 'input_combine_kws' not in state:
@@ -1816,7 +1834,7 @@ class SpaceConvolution:
                  database, 
                  source_spectrum=None,
                  ncores=-1, 
-                 use_gpu=False, 
+                 device=None, 
                  verbose=True,
                  show_plots=False, 
                  show_progress=True,
@@ -1831,8 +1849,9 @@ class SpaceConvolution:
         
         self.database = database
         self.source_spectrum = source_spectrum
+        set_cpu_threads(ncores)
         self.ncores = ncores
-        self.use_gpu = use_gpu
+        self.device = device
         self.verbose = verbose
         self.show_plots = show_plots
         self.overwrite = overwrite
@@ -1840,6 +1859,7 @@ class SpaceConvolution:
         self.concat = None
         self._inst_stpsf = None
         self._inst_webbpsfext = None
+        self._psf_convolver = None
         self._grid_fetched = False
         self.fetch_opd_by_date = fetch_opd_by_date
         self.opd_query_date = ''
@@ -1852,9 +1872,6 @@ class SpaceConvolution:
             os.makedirs(self.output_basedir)
         if not os.path.isdir(self.output_dir):
             os.makedirs(self.output_dir)
-        if self.use_gpu:
-            print("Warning! GPU implementation still in progress; setting use_gpu to False.")
-            self.use_gpu = False
 
         convolution_method = convolution_method.lower()
         if convolution_method not in {'auto', 'localized', 'full'}:
@@ -2194,7 +2211,7 @@ class SpaceConvolution:
             self._psfcube_off = inst_off.calc_datacube(source_weights['wavelengths'], oversample=oversample, fov_pixels=35)[2].data
 
         psf_off = np.average(self._psfcube_off, axis=0, weights=source_weights['weights'])
-        self._psf_shift = get_stpsf_model_center_offset(psf_off, osamp=oversample)
+        self._psf_shift = get_stpsf_model_center_offset(psf_off, osamp=oversample, device=self.device)
     
     
     def fetch_psf_grid(self, recalc_psf_grid=False):
@@ -2311,7 +2328,8 @@ class SpaceConvolution:
             inst_webbpsfext = self.inst_webbpsfext
             coron_tmaps_osamp = []
             for c_coron in self._c_coron_sci:
-                coron_tmap = self.transmission_map_fn(inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **self.transmission_map_kwargs)
+                with use_device(self.device):
+                    coron_tmap = self.transmission_map_fn(inst_webbpsfext, c_coron, osamp=self.osamp, shape=(self._ny, self._nx), **self.transmission_map_kwargs)
                 coron_tmaps_osamp.append(coron_tmap)
             self._coron_tmaps_osamp = np.asarray(coron_tmaps_osamp)
         else:
@@ -2319,6 +2337,7 @@ class SpaceConvolution:
 
 
     def set_crop(self, cropped_shape=None):
+        self._psf_convolver = None # The cached Fourier transforms of the PSFs depend on the shape of the images
         self.cropped_shape = (np.asarray(cropped_shape) if cropped_shape is not None else cropped_shape)
         if self._grid_fetched:
             if cropped_shape is not None:
@@ -2392,28 +2411,37 @@ class SpaceConvolution:
             
         c_star_in_cr_osamp = c_to_c_osamp(c_star_in_cr, sfac)
         model_con_out = np.zeros((len(self.posangs_sci), self.ny, self.nx))
+        convolver = self._get_psf_convolver()
         for i,posang in enumerate(self.posangs_sci):
-            model_rot = rotate_image(model_osamp, posang, cent=c_star_in_cr_osamp, use_gpu=self.use_gpu, cval0=0)
-            model_rot = pad_or_crop_image(model_rot, shape_osamp, cent=c_star_in_cr_osamp, new_cent=c_star_osamp, cval0=0.)
+            model_rot = rotate_image(model_osamp, posang, cent=c_star_in_cr_osamp, cval0=0, device=self.device)
+            model_rot = pad_or_crop_image(model_rot, shape_osamp, cent=c_star_in_cr_osamp, new_cent=c_star_osamp, cval0=0., device=self.device)
 
-            model_con = convolve_with_spatial_psfs(model_rot, 
-                                                   self.psfs, 
-                                                   self.psf_inds_osamp[i],
-                                                   coron_tmap=self.coron_tmaps_osamp[i],
-                                                   use_gpu=self.use_gpu, 
-                                                   ncores=self.ncores,
-                                                   method=self.convolution_method,
-                                                   patch_bounds=self._conv_patch_bounds[i],
-                                                   used_inds=self._conv_used_inds[i],
-                                                   )
+            model_con = convolver(model_rot, 
+                                  self.psf_inds_osamp[i],
+                                  coron_tmap=self.coron_tmaps_osamp[i],
+                                  method=self.convolution_method,
+                                  patch_bounds=self._conv_patch_bounds[i],
+                                  used_inds=self._conv_used_inds[i],
+                                  )
             if distortion_aper is not None:
                 model_con, _ = distort_image(model_con, distortion_aper, self.c_coron_sci[i], self.pxscale, 0., self.osamp,
-                                              method='linear', c_star=self.c_star, fill_value=0.)
+                                              method='linear', c_star=self.c_star, fill_value=0., device=self.device)
 
             model_con_out[i] = webbpsf_ext.image_manip.frebin(model_con, scale=1/self.osamp, total=False)
 
         return model_con_out
     
+
+    def _get_psf_convolver(self):
+        """
+        Returns the SpatialPSFConvolver for the current PSF grid and device. This is kept so that the Fourier transforms
+        of the PSFs are only computed once rather than for every call to convolve_model.
+        """
+        convolver = getattr(self, '_psf_convolver', None)
+        if convolver is None or convolver.psfs is not self.psfs or convolver.device != get_device(self.device):
+            self._psf_convolver = SpatialPSFConvolver(self.psfs, device=self.device)
+        return self._psf_convolver
+
 
     def _compute_patch_bounds(self, psf_inds, psfs_shape):
         patch_bounds = []
@@ -2435,6 +2463,7 @@ class SpaceConvolution:
             for key in ['psfs', 'psf_offsets_polar', 'psf_offsets', '_coron_tmaps_osamp', '_psf_inds_osamp']:
                 if key in state:
                     del state[key]
+        state['_psf_convolver'] = None # Cached Fourier transforms of the PSFs (which live on the device) are not saved
         inst_stpsf = state.get('_inst_stpsf', state.get('inst_stpsf'))
         if inst_stpsf is not None and isinstance(inst_stpsf.pupilopd, fits.hdu.hdulist.HDUList):
             inst_stpsf.pupilopd = None
@@ -2449,6 +2478,9 @@ class SpaceConvolution:
             state['_inst_webbpsfext'] = state.pop('inst_webbpsfext')
 
         self.__dict__.update(state) # Restore attributes
+        self.__dict__.pop('use_gpu', None) # Instances saved before PyTorch devices replaced use_gpu may still carry this
+        self.device = _usable_device(state.get('device'))
+        self._psf_convolver = None
         if (self._inst_stpsf is not None) and (self._inst_stpsf.pupilopd is None) and self.fetch_opd_by_date:
             self._inst_stpsf.load_wss_opd_by_date(self.opd_query_date)
         if self._grid_fetched:

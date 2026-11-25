@@ -1,6 +1,6 @@
 from .utils import (xy_polar_ang_displacement, c_to_c_osamp, pad_or_crop_image, px_size_to_ang_size, ang_size_to_proj_sep, ang_size_to_px_size, dist_to_pt)
 from .distortion import get_siaf_aper
-from .convolution import (psf_convolve_cpu, apply_partial_dist_to_stpsf_hdul)
+from .convolution import (psf_convolve, apply_partial_dist_to_stpsf_hdul)
 from .rdi import (compute_rdi_coefficients)
 
 import numpy as np
@@ -311,11 +311,11 @@ def generate_nptsrc_model_cube(spacerdi, ptsrc_params, ptsrc_hduls=None, blur_pa
 
             if f'detxsig_{i+1}' in blur_params:
                 det_kernel = Gaussian2DKernel(blur_params[f'detxsig_{i+1}']*osamp, blur_params[f'detysig_{i+1}']*osamp, np.deg2rad(blur_params[f'dettheta_{i+1}']))
-                psf = psf_convolve_cpu(psf, det_kernel)
+                psf = psf_convolve(psf, det_kernel, device=spacerdi.device)
 
             if f'skyxsig_{i+1}' in blur_params:
                 sky_kernel = Gaussian2DKernel(blur_params[f'skyxsig_{i+1}']*osamp, blur_params[f'skyysig_{i+1}']*osamp, np.deg2rad(blur_params[f'skytheta_{i+1}']-posang))
-                psf = psf_convolve_cpu(psf, sky_kernel)
+                psf = psf_convolve(psf, sky_kernel, device=spacerdi.device)
                 
             if ext==0:
                 hdul_in = fits.HDUList([fits.PrimaryHDU(psf, hdul[ext].header)])
@@ -323,13 +323,13 @@ def generate_nptsrc_model_cube(spacerdi, ptsrc_params, ptsrc_hduls=None, blur_pa
 
             im = pad_or_crop_image(psf, np.array(hcube.shape[-2:])*osamp,
                            cent=None, new_cent=c_to_c_osamp(xy_sci+spacerdi.convolver._psf_shift, osamp), cval0=0.,
-                           nan_prop_threshold=1e-8, zero_prop_threshold=1e-8)
+                           nan_prop_threshold=1e-8, zero_prop_threshold=1e-8, device=spacerdi.device)
             
             if osamp != 1:
                 im = image_manip.frebin(im, scale=1./osamp, total=True)
 
             if spacerdi.convolver.blursigma != 0: # This is applied to the data without oversampling, so is applied likewise here.
-                im = psf_convolve_cpu(im, blur_kernel)
+                im = psf_convolve(im, blur_kernel, device=spacerdi.device)
 
             hcube[i,j] = im
         
@@ -566,7 +566,8 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, ptsrc_hduls=None, err_weighting=Fal
             scale_optzone = roi
         autoscale_coeffs = compute_rdi_coefficients((rdi_reduc.rolls-fmrdi_fixed)[np.newaxis, :]/sig,
                                                     fmimages[autoscale]/sig,
-                                                    [scale_optzone])
+                                                    [scale_optzone],
+                                                    device='cpu') # A tiny problem that is solved many times: keep full precision and avoid device overhead
         
         modelcoeffs[autoscale] = np.median(autoscale_coeffs, axis=(0,1,3))
 

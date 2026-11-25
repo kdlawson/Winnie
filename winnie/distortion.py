@@ -1,9 +1,7 @@
 import astropy.units as u
-from scipy.interpolate import RegularGridInterpolator
-from .utils import xy_polar_ang_displacement, c_to_c_osamp
+from .utils import xy_polar_ang_displacement, c_to_c_osamp, sample_image
 import numpy as np
 from copy import deepcopy
-from scipy.interpolate import RegularGridInterpolator
 from sklearn.preprocessing import PolynomialFeatures
 import pysiaf
 import scipy.linalg as linalg
@@ -70,28 +68,37 @@ def _undistorted_ref_from_detector_ref(
     return c_ref_undist_det
 
 
+_INTERP_ORDERS = {'nearest': 0, 'linear': 1, 'cubic': 3}
+
+
 def _interp_image(image, x_grid, y_grid, x_samp, y_samp,
-                  method='cubic', fill_value=0., prop_nans=True, prop_threshold=0.1):
-    
-    if (prop_nans) and (method not in ['nearest', 'linear']):
+                  method='cubic', fill_value=0., prop_nans=True, prop_threshold=0.1, device=None):
+    """
+    Interpolates image, which is defined on the regular grid of coordinates x_grid and y_grid, at the coordinates
+    x_samp and y_samp (which are arrays with the same shape as image) with torch's grid_sample. Samples outside of the
+    grid are set to fill_value. If prop_nans is True and the method is 'cubic', non-finite pixels are filled with the
+    median of the image prior to interpolation, and any samples whose linearly interpolated non-finite indicator exceeds
+    prop_threshold are set to NaN.
+    """
+    if method not in _INTERP_ORDERS:
+        raise ValueError(f"method must be one of {list(_INTERP_ORDERS)}")
+    order = _INTERP_ORDERS[method]
+    image = np.asarray(image)
+
+    # Sampling coordinates in units of pixels of image
+    x_pix = (x_samp - x_grid[0, 0]) / (x_grid[0, 1] - x_grid[0, 0])
+    y_pix = (y_samp - y_grid[0, 0]) / (y_grid[1, 0] - y_grid[0, 0])
+
+    if (prop_nans) and (order == 3):
         nans = ~np.isfinite(image)
         any_nans = np.any(nans)
-        
-    if (not prop_nans) or (method in ['nearest', 'linear']) or (not any_nans):
-        interpolator = RegularGridInterpolator((y_grid[:, 0], x_grid[0]), image, method=method, bounds_error=False, fill_value=fill_value)
-        out = interpolator(np.array([y_samp.ravel(), x_samp.ravel()]).T)
-        
-    else:
-        image_fill = np.where(nans, np.nanmedian(image), image)
-        
-        interpolator = RegularGridInterpolator((y_grid[:, 0], x_grid[0]), image_fill, method=method, bounds_error=False, fill_value=fill_value)
-        im_out = interpolator(np.array([y_samp.ravel(), x_samp.ravel()]).T)
-        
-        interpolator = RegularGridInterpolator((y_grid[:, 0], x_grid[0]), nans.astype(float), method='linear', bounds_error=False, fill_value=0)
-        nans_out = interpolator(np.array([y_samp.ravel(), x_samp.ravel()]).T) > prop_threshold
-        out = np.where(nans_out, np.nan, im_out)
-        
-    return out.reshape(image.shape)
+
+    if (not prop_nans) or (order != 3) or (not any_nans):
+        return sample_image(image, x_pix, y_pix, order=order, cval=fill_value, device=device)
+
+    im_out = sample_image(np.where(nans, np.nanmedian(image), image), x_pix, y_pix, order=order, cval=fill_value, device=device)
+    nans_out = sample_image(nans.astype(float), x_pix, y_pix, order=1, cval=0, device=device) > prop_threshold
+    return np.where(nans_out, np.nan, im_out)
 
 
 def distort_image(
@@ -104,7 +111,8 @@ def distort_image(
     method='cubic',
     c_star=None,
     fill_value=0.,
-    return_info=False
+    return_info=False,
+    device=None
 ):
     """
     Apply SIAF distortion to a north-up undistorted input image and orient it
@@ -121,6 +129,10 @@ def distort_image(
     forward modeling would require that we convolve with rotated PSFs to save
     the extra interpolation step. Given the typical size of PSF grids,
     rotating then convolving and distorting is likely preferable.
+
+    The interpolation is carried out with PyTorch on device (a string or
+    torch.device; if None, the default device is used: see winnie.backend).
+    method may be 'nearest', 'linear', or 'cubic' (bicubic).
 
     Returns
     -------
@@ -187,7 +199,8 @@ def distort_image(
         y_in,
         method=method,
         fill_value=fill_value,
-        prop_nans=False
+        prop_nans=False,
+        device=device
     )
 
     if posang_out != 0:
@@ -235,6 +248,7 @@ def undistort_image(
     c_star=None,
     fill_value=0.,
     return_info=False,
+    device=None,
 ):
     """
     Correct astrometric distortion and derotate an input image to north-up in one
@@ -248,6 +262,10 @@ def undistort_image(
 
     The result should broadly match undistort_image followed by derotation to
     north-up as separate operations.
+
+    The interpolation is carried out with PyTorch on device (a string or
+    torch.device; if None, the default device is used: see winnie.backend).
+    method may be 'nearest', 'linear', or 'cubic' (bicubic).
 
     Returns
     -------
@@ -312,7 +330,8 @@ def undistort_image(
         y_in,
         method=method,
         fill_value=fill_value,
-        prop_nans=True
+        prop_nans=True,
+        device=device
     )
 
     # Location of the undistorted detector-frame reference point after the
