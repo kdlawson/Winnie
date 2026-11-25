@@ -141,3 +141,20 @@ def test_jackknife_multi_frame(multi_frame_db):
     rdi.load_concat(0)
     inds, rescube, errcube = rdi.jackknife_references(show_progress=False)
     assert rescube.shape == (c.NREF, len(c.SCI_ROLLS), c.NY, c.NX)
+
+
+@pytest.mark.parametrize('kw, match', [(dict(correct_distortion=True), 'distortion'),
+                                       (dict(distort_models=True), 'distortion'),
+                                       (dict(save_coron_transmission=True), 'save_coron_transmission')])
+def test_jwst_only_options_rejected(db, kw, match):
+    with pytest.raises(ValueError, match=match):
+        RCRDI(db, verbose=False, **kw)
+
+
+def test_jwst_only_calls_rejected(db):
+    rdi = _load(db)
+    with pytest.raises(ValueError, match='distortion'):
+        rdi.run_rdi(correct_distortion=True)
+    # No convolver: the base code would build a JWST transmission map.
+    with pytest.raises(ValueError, match='prepare_convolution'):
+        rdi.make_derot_coron_maps()

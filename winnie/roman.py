@@ -740,18 +740,26 @@ class RCConvolution(SpaceConvolution):
             self._grid_fetched = False
 
 
+_NO_DISTORTION_MSG = 'No RC distortion model; correct_distortion and distort_models must be False.'
+
+
 class RCRDI(SpaceRDI):
     """
     SpaceRDI for Roman Coronagraph (RC) data, built from an RCDatabase of
-    corgidrp L3 products. Distortion correction and coronagraph transmission
-    maps are off by default, since they rely on JWST-only tools (pysiaf,
-    webbpsf_ext).
+    corgidrp L3 products. Distortion correction is not supported (no RC
+    distortion model), and coronagraph transmission maps come from the PSF
+    grid set by prepare_convolution.
     """
     reduction_class = RCReduction
     convolution_class = RCConvolution
 
     def __init__(self, database=None, data_ext=None, correct_distortion=False, distort_models=False,
                  save_coron_transmission=False, **kwargs):
+        if correct_distortion or distort_models:
+            raise ValueError(_NO_DISTORTION_MSG)
+        if save_coron_transmission:
+            raise ValueError('save_coron_transmission is not supported for RC; call '
+                             'make_derot_coron_maps(save_products=True) after prepare_convolution.')
         if data_ext is None and kwargs.get('from_fits') is None:
             # corgidrp names end in '_l3_.fits', so take the last non-empty token.
             f = database.obs[list(database.obs.keys())[0]]['FITSFILE'][0]
@@ -778,6 +786,29 @@ class RCRDI(SpaceRDI):
         super()._save_products(products, include_instance=include_instance, add_output_to_db=False)
         if add_output_to_db:
             self.database.add_product(self.concat, products.filename)
+
+    def imcube_to_products(self, imcube_in, errcube_in=None, derotate=True, correct_distortion=None, **kwargs):
+        """
+        As SpaceRDI.imcube_to_products, but rejects distortion correction
+        (also reached via run_rdi and make_model_reduc(match_reduc=...)).
+        """
+        if correct_distortion is None:
+            correct_distortion = self.correct_distortion
+        if correct_distortion:
+            raise ValueError(_NO_DISTORTION_MSG)
+        return super().imcube_to_products(imcube_in, errcube_in=errcube_in, derotate=derotate,
+                                          correct_distortion=correct_distortion, **kwargs)
+
+    def make_derot_coron_maps(self, collapse_rolls=False, save_products=False, correct_distortion=None):
+        """
+        As SpaceRDI.make_derot_coron_maps, but requires the transmission maps
+        from prepare_convolution (the base fallback builds JWST maps).
+        """
+        if self.convolver is None or self.convolver.coron_tmaps_osamp is None:
+            raise ValueError('RC coronagraph maps come from the PSF grid; run prepare_convolution with '
+                             'generate_rc_psf_grid first.')
+        return super().make_derot_coron_maps(collapse_rolls=collapse_rolls, save_products=save_products,
+                                             correct_distortion=correct_distortion)
 
     def load_concat(self, concat, cropped_shape=None, align=True, combine_frames=True):
         """

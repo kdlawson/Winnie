@@ -226,3 +226,10 @@ def test_deconvolution(rdi, tmp_path):
     deconv, reduc = rdi.run_deconvolution(num_iter=2, show_progress=False)
     assert deconv.im.shape == reduc.im.shape
     assert np.isfinite(deconv.im).mean() > 0.5
+
+
+def test_derot_coron_maps(rdi, tmp_path):
+    _prepare(rdi, tmp_path)
+    tmaps = rdi.make_derot_coron_maps()
+    vals = tmaps.im[np.isfinite(tmaps.im)]
+    assert vals.size > 0 and vals.min() < 0.1 and 0.99 < vals.max() < 1.001
