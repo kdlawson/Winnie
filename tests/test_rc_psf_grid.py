@@ -217,3 +217,12 @@ def test_grid_file(rdi, tmp_path):
     assert np.allclose(rdi.convolver.psfs, grid['psfs'])
     with pytest.raises(ValueError):
         generate_rc_psf_grid(inst)
+
+
+def test_deconvolution(rdi, tmp_path):
+    # No SIAF aperture: the transmission map must not go through the JWST distortion model.
+    _prepare(rdi, tmp_path)
+    assert rdi.convolver.transmission_map_fn is rc_transmission_map
+    deconv, reduc = rdi.run_deconvolution(num_iter=2, show_progress=False)
+    assert deconv.im.shape == reduc.im.shape
+    assert np.isfinite(deconv.im).mean() > 0.5

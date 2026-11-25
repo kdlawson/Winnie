@@ -1624,7 +1624,8 @@ class SpaceRDI:
             if self.convolver.transmission_map_fn is None:
                 deconv_coron_tmaps[i] = 1.
             else:
-                if reduc.distortion_corrected:
+                # No SIAF aperture (e.g., Roman Coronagraph): no distortion model, so build the map directly.
+                if reduc.distortion_corrected or self.siaf_aper is None:
                     deconv_coron_tmaps[i] = self.convolver.transmission_map_fn(
                         self.convolver.inst_webbpsfext, c_coron,
                         return_oversample=False, osamp=self.convolver.osamp, nd_squares=False,
